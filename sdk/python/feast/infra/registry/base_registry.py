@@ -70,6 +70,41 @@ class BaseRegistry(ABC):
     # ``registry_config.serve_features_while_materializing``.
     serve_features_while_materializing: bool = False
 
+    # Opt-in: record feature-definition changes and materialization-partition
+    # provenance. Registries built from a RegistryConfig set these from the
+    # ``definition_tracking`` block. All tracking entry points below are no-ops
+    # while ``definition_tracking_enabled`` is False, so existing callers and
+    # behavior are unchanged.
+    definition_tracking_enabled: bool = False
+    require_explicit_partition_provenance: bool = False
+
+    def get_definition_tracking_state(self, project: Optional[str] = None) -> Any:
+        """Return the registry's ``DefinitionTrackingState`` message.
+
+        Args:
+            project: Project whose tracking state to return. Registries that
+                keep a single state (file/S3/GCS) ignore this; per-project
+                backends (SQL) require it.
+
+        Implementations that do not persist tracking state return an empty
+        message. Never raises for an uninitialized registry.
+        """
+        from feast.protos.feast.core.DefinitionTracking_pb2 import (
+            DefinitionTrackingState,
+        )
+
+        return DefinitionTrackingState()
+
+    def save_definition_tracking_state(
+        self, state: Any, project: Optional[str] = None
+    ) -> None:
+        """Persist a ``DefinitionTrackingState`` message. No-op by default."""
+        return None
+
+    def commit_definition_tracking(self) -> None:
+        """Flush tracking-state writes to the backing store, if needed."""
+        return None
+
     # Entity operations
     @abstractmethod
     def apply_entity(self, entity: Entity, project: str, commit: bool = True):

@@ -168,6 +168,22 @@ class McpRegistryConfig(FeastBaseModel):
     """ bool: Enable MCP support on the REST registry server. """
 
 
+class DefinitionTrackingConfig(FeastBaseModel):
+    """Opt-in tracking of feature-definition changes and their materialized impact."""
+
+    enabled: StrictBool = False
+    """ bool: Record a change record on every apply whose definition content
+        changed, record materialization-partition provenance, and expose impact
+        analysis / resumable recompute plans. When False (the default), nothing
+        is recorded and all existing behavior is unchanged. """
+
+    require_explicit_partition_provenance: StrictBool = False
+    """ bool: When True, impact analysis refuses to classify partitions whose
+        provenance was never recorded (materialized before tracking was turned
+        on) instead of conservatively recommending a recompute. Defaults to
+        False, i.e. unknown partitions are reported as "recompute to be safe". """
+
+
 class RegistryConfig(FeastBaseModel):
     """Metadata Store Configuration. Configuration that relates to reading from and writing to the Feast registry."""
 
@@ -224,6 +240,11 @@ class RegistryConfig(FeastBaseModel):
 
     mcp: Optional[McpRegistryConfig] = None
     """ McpRegistryConfig: MCP (Model Context Protocol) configuration for the registry REST server. """
+
+    definition_tracking: DefinitionTrackingConfig = Field(
+        default_factory=DefinitionTrackingConfig
+    )
+    """ DefinitionTrackingConfig: Opt-in feature-definition change tracking. """
 
     @staticmethod
     def _normalize_postgres_scheme(value: str, field_name: str) -> str:

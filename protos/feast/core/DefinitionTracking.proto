@@ -1,0 +1,146 @@
+//
+// Copyright 2026 The Feast Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+syntax = "proto3";
+package feast.core;
+
+option go_package = "github.com/feast-dev/feast/go/protos/feast/core";
+option java_outer_classname = "DefinitionTrackingProto";
+option java_package = "feast.proto.core";
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// How a single feature changed between two tracked definitions of the same
+// feature view.
+enum FeatureChangeType {
+    FEATURE_CHANGE_UNSPECIFIED = 0;
+    // Feature did not exist in the previous definition.
+    FEATURE_ADDED = 1;
+    // Feature existed before and no longer exists (or was explicitly removed).
+    FEATURE_REMOVED = 2;
+    // Feature exists in both definitions but its value type changed.
+    FEATURE_TYPE_CHANGED = 3;
+    // Feature exists in both definitions with the same type, but the view's
+    // computation logic changed (transformation/UDF, derived-view inputs,
+    // source field mapping, or mode), so its values may differ.
+    FEATURE_LOGIC_CHANGED = 4;
+}
+
+// A single recorded change of a feature view's definition.
+message DefinitionChangeRecord {
+    // Monotonic per (project, feature view) sequence number.
+    int64 sequence_number = 1;
+    string project = 2;
+    string feature_view_name = 3;
+    // "feature_view" | "stream_feature_view" | "on_demand_feature_view" | "label_view"
+    string feature_view_type = 4;
+
+    // Content fingerprints. These are derived from the definition content only,
+    // never from a manually supplied version string.
+    string previous_fingerprint = 5;
+    string fingerprint = 6;
+    // Fingerprint of the computation logic only (see feature_logic_changed).
+    string previous_logic_fingerprint = 7;
+    string logic_fingerprint = 8;
+
+    // Version numbers (registry-assigned, informational). -1 when unknown.
+    int32 previous_version_number = 9;
+    int32 version_number = 10;
+
+    // Per-feature changes, sorted by feature name.
+    repeated FeatureChange feature_changes = 11;
+
+    // Time range (event-time) the change can affect: from the oldest
+    // materialization interval start of the previous definition up to "now"
+    // (the point at which the new definition took effect).
+    google.protobuf.Timestamp affected_start = 12;
+    google.protobuf.Timestamp affected_end = 13;
+
+    google.protobuf.Timestamp recorded_at = 14;
+    // True when the previous definition's fingerprint was not available and the
+    // change could not be classified (e.g. first tracked apply of an existing
+    // view with a pre-tracking registry). Consumers must not draw conclusions
+    // about the affected range for such records.
+    bool baseline_missing = 15;
+}
+
+message FeatureChange {
+    string feature_name = 1;
+    FeatureChangeType change_type = 2;
+    // Human-readable key/value descriptions of the old and new type or logic
+    // fingerprints. Empty string when not applicable.
+    string previous_type = 3;
+    string new_type = 4;
+}
+
+// Materialization provenance: which definition fingerprint produced a
+// materialized partition. A "partition" is one materialization interval
+// recorded on a feature view.
+message PartitionRecord {
+    string project = 2;
+    string feature_view_name = 3;
+    // Definition fingerprint active when the partition was materialized.
+    string fingerprint = 4;
+    // Logic fingerprint active when the partition was materialized.
+    string logic_fingerprint = 5;
+    int32 version_number = 6;
+    google.protobuf.Timestamp start_time = 7;
+    google.protobuf.Timestamp end_time = 8;
+    google.protobuf.Timestamp materialized_at = 9;
+}
+
+enum RecomputePartitionStatus {
+    RECOMPUTE_STATUS_UNSPECIFIED = 0;
+    RECOMPUTE_PENDING = 1;
+    RECOMPUTE_RUNNING = 2;
+    RECOMPUTE_COMPLETED = 3;
+    RECOMPUTE_FAILED = 4;
+}
+
+message RecomputePartition {
+    google.protobuf.Timestamp start_time = 1;
+    google.protobuf.Timestamp end_time = 2;
+    RecomputePartitionStatus status = 3;
+    // Why this partition is required (or not). Populated from the impact
+    // analysis so the plan is auditable after the fact.
+    string reason = 4;
+    google.protobuf.Timestamp started_at = 5;
+    google.protobuf.Timestamp completed_at = 6;
+    string error = 7;
+    // Ranges recorded before tracking existed / with unknown provenance.
+    bool unknown_provenance = 8;
+}
+
+// A resumable recompute plan for one feature view.
+message RecomputePlan {
+    string plan_id = 1;
+    string project = 2;
+    string feature_view_name = 3;
+    string from_fingerprint = 4;
+    string to_fingerprint = 5;
+    // Change record sequence number this plan addresses (0 if none).
+    int64 change_sequence_number = 6;
+    repeated RecomputePartition partitions = 7;
+    google.protobuf.Timestamp created_at = 8;
+    google.protobuf.Timestamp updated_at = 9;
+}
+
+message DefinitionTrackingState {
+    repeated DefinitionChangeRecord changes = 1;
+    repeated PartitionRecord partitions = 2;
+    repeated RecomputePlan plans = 3;
+}

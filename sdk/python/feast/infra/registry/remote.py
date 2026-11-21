@@ -107,6 +107,17 @@ class RemoteRegistry(BaseRegistry):
         self.serve_features_while_materializing = (
             registry_config.serve_features_while_materializing
         )
+        # Recording happens on the registry server (the server's own
+        # feature_store.yaml decides that). A client opts in to *reading* the
+        # tracking state here; writes are no-ops on this backend.
+        tracking_config = getattr(registry_config, "definition_tracking", None)
+        self.definition_tracking_enabled = bool(
+            tracking_config is not None and tracking_config.enabled
+        )
+        self.require_explicit_partition_provenance = bool(
+            tracking_config is not None
+            and getattr(tracking_config, "require_explicit_partition_provenance", False)
+        )
         self.channel = self._create_grpc_channel(registry_config)
         weakref.finalize(self, self.channel.close)
 
@@ -708,6 +719,32 @@ class RemoteRegistry(BaseRegistry):
 
     def proto(self) -> RegistryProto:
         return self.stub.Proto(Empty())
+
+    def get_definition_tracking_state(self, project: Optional[str] = None) -> Any:
+        """Read tracking state from the server's registry proto.
+
+        The server records changes; a remote client can only read them. An
+        empty state means the server has tracking disabled or nothing has been
+        recorded yet.
+        """
+        from feast.protos.feast.core.DefinitionTracking_pb2 import (
+            DefinitionTrackingState,
+        )
+
+        try:
+            proto = self.stub.Proto(Empty())
+        except Exception:
+            return DefinitionTrackingState()
+        return proto.definition_tracking
+
+    def save_definition_tracking_state(
+        self, state: Any, project: Optional[str] = None
+    ) -> None:
+        # Writes happen on the server during apply/materialize.
+        return None
+
+    def commit_definition_tracking(self) -> None:
+        return None
 
     def commit(self):
         self.stub.Commit(Empty())

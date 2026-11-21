@@ -21,6 +21,7 @@ Commands:
   apply                    Create or update a feature store deployment
   configuration            Display Feast configuration
   delete                   Delete a Feast object from the registry
+  definition-changes       Inspect tracked feature-definition changes
   demo-notebooks           Generate demo Jupyter notebooks for the project
   entities                 Access entities
   feature-views            Access feature views
@@ -519,6 +520,20 @@ feast registry create-schema
 ```
 
 This command only applies to SQL-based registries (`registry_type: sql`). It is safe to run multiple times — existing tables are not modified.
+
+## Definition changes
+
+Inspect opt-in feature-definition change tracking. Requires
+`definition_tracking.enabled: true` under `registry`; see
+[Definition change tracking](registries/definition-tracking.md).
+
+```text
+feast definition-changes list [--feature-view NAME]
+feast definition-changes analyze NAME [--sequence N] [--json]
+feast definition-changes plan NAME [--sequence N]
+feast definition-changes plan-status PLAN_ID
+feast definition-changes execute PLAN_ID
+```
 
 ## MLflow
 

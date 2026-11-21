@@ -318,6 +318,32 @@ Supporting services logic: `infra/feast-operator/internal/controller/services/`
 
 ---
 
+## Definition Tracking (opt-in)
+
+**Files**: `sdk/python/feast/definition_tracking/` (`fingerprint.py`, `tracker.py`)
+
+Records feature-definition changes and materialization provenance so impact can be
+assessed and recompute planned. Disabled by default via
+`registry.definition_tracking.enabled`; when off it is a complete no-op.
+
+- **Fingerprints** (content + logic) are SHA-256 over canonical JSON of the
+  definition proto. Content covers authored fields; logic covers only
+  value-affecting fields (schema, join keys, TTL, sources, transformation, mode).
+- **Change records** are appended in `Registry.definition_tracking` (file/S3/GCS/
+  HDFS) or a per-project `definition_tracking` row (SQL) on every `apply` whose
+  content fingerprint changed. Hooked in `Registry.apply_feature_view` /
+  `SqlRegistry.apply_feature_view` via a wrapper around the existing impl.
+- **Partition provenance** is recorded in `apply_materialization` (active
+  fingerprint + interval), one record per materialization interval.
+- **Impact analysis** (`ChangeImpact`) classifies each partition as must-recompute
+  / can-skip / undetermined from materialization intervals + provenance + the
+  derived-view/ODFV dependency graph. Undetermined is never collapsed into a guess.
+- **Recompute plans** are keyed by `(project, view, from_fp, to_fp)`, store
+  per-partition status, and execute via the ordinary `materialize()` path so they
+  are resumable and do not add computation code.
+
+---
+
 ## Serialization Layer
 
 All persistent metadata and the feature server wire format use **Protocol Buffers**.
@@ -350,6 +376,7 @@ When adding a new field to a Feast object:
 | Registry diff | `sdk/python/feast/diff/registry_diff.py` |
 | Registry (proto/file) | `sdk/python/feast/infra/registry/registry.py` |
 | Registry (SQL) | `sdk/python/feast/infra/registry/sql.py` |
+| Definition tracking | `sdk/python/feast/definition_tracking/` |
 | PIT join | `sdk/python/feast/infra/offline_stores/offline_utils.py` |
 | Online store interface | `sdk/python/feast/infra/online_stores/online_store.py` |
 | Entity key serialization | `sdk/python/feast/infra/online_stores/helpers.py` |

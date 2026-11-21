@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 from google.protobuf.duration_pb2 import Duration
@@ -251,6 +251,19 @@ class Registry(BaseRegistry):
             registry_config.serve_features_while_materializing
             if registry_config is not None
             else False
+        )
+
+        tracking_config = (
+            getattr(registry_config, "definition_tracking", None)
+            if registry_config is not None
+            else None
+        )
+        self.definition_tracking_enabled = bool(
+            tracking_config is not None and tracking_config.enabled
+        )
+        self.require_explicit_partition_provenance = bool(
+            tracking_config is not None
+            and getattr(tracking_config, "require_explicit_partition_provenance", False)
         )
 
         self.cache_mode = (
@@ -752,6 +765,29 @@ class Registry(BaseRegistry):
         commit: bool = True,
         no_promote: bool = False,
     ):
+        # Opt-in definition tracking: capture the active definition before the
+        # apply and record a change after it. Both helpers are cheap no-ops
+        # when tracking is disabled, so the existing path is untouched.
+        previous = (
+            self._tracking_active_definition(feature_view.name, project)
+            if self.definition_tracking_enabled
+            else None
+        )
+
+        self._apply_feature_view_impl(
+            feature_view, project, commit=commit, no_promote=no_promote
+        )
+
+        if self.definition_tracking_enabled:
+            self._record_definition_change(feature_view, project, previous)
+
+    def _apply_feature_view_impl(
+        self,
+        feature_view: BaseFeatureView,
+        project: str,
+        commit: bool = True,
+        no_promote: bool = False,
+    ):
         feature_view.ensure_valid()
 
         now = _utc_now()
@@ -941,6 +977,129 @@ class Registry(BaseRegistry):
         if commit:
             self.commit()
 
+    # ---------------------------------------------------- definition tracking
+
+    def get_definition_tracking_state(self, project: Optional[str] = None) -> Any:
+        """Return the persisted tracking state (empty when never written)."""
+        try:
+            self._get_registry_proto(project=None, allow_cache=True)
+        except Exception:
+            # Reads must never fail because tracking metadata is unreadable.
+            from feast.protos.feast.core.DefinitionTracking_pb2 import (
+                DefinitionTrackingState,
+            )
+
+            return DefinitionTrackingState()
+        if self.cached_registry_proto is None:
+            from feast.protos.feast.core.DefinitionTracking_pb2 import (
+                DefinitionTrackingState,
+            )
+
+            return DefinitionTrackingState()
+        return self.cached_registry_proto.definition_tracking
+
+    def save_definition_tracking_state(
+        self, state: Any, project: Optional[str] = None
+    ) -> None:
+        """Copy ``state`` onto the live registry proto and persist it.
+
+        ``state`` may have been read before an intervening registry refresh
+        (materialization refreshes the cache), in which case it is detached
+        from ``cached_registry_proto``. Merging by copy keeps the caller's
+        updates authoritative and avoids writing to an orphaned message.
+        """
+        if self.cached_registry_proto is None:
+            return
+        target = self.cached_registry_proto.definition_tracking
+        if target is state:
+            return
+        target.CopyFrom(state)
+
+    def commit_definition_tracking(self) -> None:
+        self.commit()
+
+    def _tracking_active_definition(
+        self, name: str, project: str
+    ) -> Optional[Tuple[bytes, Optional[int]]]:
+        """Serialized active definition for ``name`` plus its version number.
+
+        Returns ``None`` when the view does not exist yet (a new definition).
+        """
+        try:
+            active = proto_registry_utils.get_any_feature_view(
+                self.cached_registry_proto, name, project
+            )
+        except FeatureViewNotFoundException:
+            return None
+        if active is None:
+            return None
+        version_number = getattr(active, "current_version_number", None)
+        return active.to_proto().SerializeToString(), version_number
+
+    def _tracking_materialization_intervals(
+        self, project: str
+    ) -> Dict[str, List[Tuple[datetime, datetime]]]:
+        """Materialization intervals per view, read straight from the proto."""
+        from feast.utils import make_tzaware
+
+        intervals: Dict[str, List[Tuple[datetime, datetime]]] = {}
+        if self.cached_registry_proto is None:
+            return intervals
+        for collection in (
+            self.cached_registry_proto.feature_views,
+            self.cached_registry_proto.stream_feature_views,
+            self.cached_registry_proto.on_demand_feature_views,
+            self.cached_registry_proto.label_views,
+        ):
+            for view in collection:
+                if view.spec.project != project:
+                    continue
+                # ODFV / LabelView metas have no materialization_intervals.
+                raw_intervals = getattr(view.meta, "materialization_intervals", [])
+                intervals[view.spec.name] = [
+                    (
+                        make_tzaware(item.start_time.ToDatetime()),
+                        make_tzaware(item.end_time.ToDatetime()),
+                    )
+                    for item in raw_intervals
+                ]
+        return intervals
+
+    def _record_definition_change(
+        self,
+        feature_view: BaseFeatureView,
+        project: str,
+        previous: Optional[Tuple[bytes, Optional[int]]],
+    ) -> None:
+        from feast.definition_tracking.tracker import DefinitionTracker
+
+        state = self.get_definition_tracking_state()
+        tracker = DefinitionTracker(
+            project,
+            state,
+            materialization_intervals=self._tracking_materialization_intervals(project),
+        )
+
+        previous_proto = None
+        previous_version = None
+        if previous is not None:
+            previous_bytes, previous_version = previous
+            proto_class, _ = self._proto_class_for_type(
+                self._infer_fv_type_string(feature_view)
+            )
+            previous_proto = proto_class.FromString(previous_bytes)
+
+        record = tracker.record_apply(
+            feature_view_name=feature_view.name,
+            feature_view_type=self._infer_fv_type_string(feature_view),
+            current_proto=feature_view.to_proto(),
+            previous_proto=previous_proto,
+            version_number=getattr(feature_view, "current_version_number", None),
+            previous_version_number=previous_version,
+        )
+        if record is not None:
+            self.commit()
+
     def list_stream_feature_views(
         self,
         project: str,
@@ -1024,6 +1183,58 @@ class Registry(BaseRegistry):
         return proto_registry_utils.get_data_source(registry_proto, name, project)
 
     def apply_materialization(
+        self,
+        feature_view: Union[FeatureView, OnDemandFeatureView, LabelView],
+        project: str,
+        start_date: datetime,
+        end_date: datetime,
+        commit: bool = True,
+    ):
+        self._apply_materialization_impl(
+            feature_view, project, start_date, end_date, commit=commit
+        )
+        if self.definition_tracking_enabled and not isinstance(feature_view, LabelView):
+            self._record_materialized_partition(
+                feature_view, project, start_date, end_date
+            )
+
+    def _record_materialized_partition(
+        self,
+        feature_view: Union[FeatureView, OnDemandFeatureView, LabelView],
+        project: str,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> None:
+        """Record which definition fingerprint produced a materialized interval.
+
+        The provenance must reflect the definition that is active *now*, i.e.
+        the one materialization just used. The cache may have been refreshed by
+        the materialization path, so read it fresh rather than trusting a
+        snapshot captured earlier.
+        """
+        from feast.definition_tracking import fingerprint as fp
+        from feast.definition_tracking.tracker import DefinitionTracker
+
+        self._get_registry_proto(project=project, allow_cache=False)
+        try:
+            active = proto_registry_utils.get_any_feature_view(
+                self.cached_registry_proto, feature_view.name, project
+            )
+        except FeatureViewNotFoundException:
+            return
+        active_proto = active.to_proto()
+        tracker = DefinitionTracker(project, self.get_definition_tracking_state())
+        tracker.record_partition(
+            feature_view_name=feature_view.name,
+            start=start_date,
+            end=end_date,
+            fingerprint=fp.definition_fingerprint(active_proto),
+            logic_fingerprint=fp.logic_fingerprint(active_proto),
+            version_number=getattr(active, "current_version_number", None),
+        )
+        self.commit()
+
+    def _apply_materialization_impl(
         self,
         feature_view: Union[FeatureView, OnDemandFeatureView, LabelView],
         project: str,

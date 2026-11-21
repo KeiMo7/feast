@@ -36,6 +36,7 @@ import "feast/core/Permission.proto";
 import "feast/core/Project.proto";
 import "feast/core/FeatureViewVersion.proto";
 import "feast/core/LabelView.proto";
+import "feast/core/DefinitionTracking.proto";
 
 // Next id: 20
 message Registry {
@@ -59,6 +60,9 @@ message Registry {
     repeated Project projects = 17;
     FeatureViewVersionHistory feature_view_version_history = 18;
     repeated LabelView label_views = 19;
+    // Opt-in feature-definition change tracking state (changes, partition
+    // provenance, recompute plans). Empty when tracking is disabled.
+    DefinitionTrackingState definition_tracking = 20;
 }
 
 message ProjectMetadata {

@@ -31,6 +31,30 @@ Please see the [RepoConfig](https://rtd.feast.dev/en/latest/#feast.repo_config.R
 
 ---
 
+## `definition_tracking` configuration
+
+The `definition_tracking` block (under `registry`) opts in to recording
+feature-definition changes and the provenance of materialized partitions. When
+disabled, behavior is identical to a Feast deployment without this feature.
+See [Definition change tracking](../registries/definition-tracking.md).
+
+{% code title="feature_store.yaml" %}
+```yaml
+registry:
+  path: data/registry.db
+  definition_tracking:
+    enabled: true
+    require_explicit_partition_provenance: false
+```
+{% endcode %}
+
+| Field | Type | Default | Behavior when unset |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `false` | No records are written; outputs and materialization are unchanged; tracking APIs raise `ValueError`. |
+| `require_explicit_partition_provenance` | `bool` | `false` | Partitions without recorded provenance are reported as *undetermined*. When `true`, impact analysis raises `FingerprintUnavailable` instead. |
+
+---
+
 ## `materialization` configuration
 
 The `materialization` block controls how Feast reads from the offline store and writes to the online store during `feast materialize` / `feast materialize-incremental` runs.

@@ -37,8 +37,10 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from feast.definition_tracking.tracker import ChangeImpact
     from feast.diff.apply_progress import ApplyProgressContext
     from feast.embedder import EmbeddingProvider
+    from feast.protos.feast.core.DefinitionTracking_pb2 import RecomputePlan
 
 import pandas as pd
 import pyarrow as pa
@@ -1017,6 +1019,507 @@ class FeatureStore:
             List of version records.
         """
         return self.registry.list_feature_view_versions(name, self.project)
+
+    # ------------------------------------------------ definition tracking API
+
+    @property
+    def definition_tracking_enabled(self) -> bool:
+        """Whether ``definition_tracking.enabled`` is set for this store."""
+        return bool(getattr(self.registry, "definition_tracking_enabled", False))
+
+    def _require_definition_tracking(self, operation: str) -> None:
+        if not self.definition_tracking_enabled:
+            raise ValueError(
+                f"{operation} requires definition tracking to be enabled. Set "
+                f"`definition_tracking:\n  enabled: true` under `registry` in "
+                f"feature_store.yaml."
+            )
+
+    def list_definition_changes(
+        self, feature_view_name: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """List recorded definition changes.
+
+        Args:
+            feature_view_name: Restrict to one view. When omitted, changes for
+                every tracked view in the project are returned.
+
+        Returns:
+            Change records as plain dicts: ``sequence_number``,
+            ``feature_view_name``, ``feature_view_type``, ``fingerprint``,
+            ``previous_fingerprint``, ``logic_changed``, ``feature_changes``
+            (each with ``feature_name``/``change_type``/``previous_type``/
+            ``new_type``), ``affected_start``/``affected_end``,
+            ``recorded_at`` and ``baseline_missing``.
+
+        Raises:
+            ValueError: When definition tracking is disabled.
+        """
+        from feast.definition_tracking.tracker import DefinitionTracker
+
+        self._require_definition_tracking("list_definition_changes")
+        state = self.registry.get_definition_tracking_state(self.project)
+        tracker = DefinitionTracker(self.project, state)
+        names = (
+            [feature_view_name]
+            if feature_view_name is not None
+            else sorted(
+                {
+                    record.feature_view_name
+                    for record in state.changes
+                    if record.project == self.project
+                }
+            )
+        )
+
+        changes: List[Dict[str, Any]] = []
+        for name in names:
+            for record in tracker.records_for(name):
+                changes.append(self._definition_change_to_dict(record))
+        changes.sort(
+            key=lambda item: (item["feature_view_name"], item["sequence_number"])
+        )
+        return changes
+
+    @staticmethod
+    def _definition_change_to_dict(record: Any) -> Dict[str, Any]:
+        from feast.definition_tracking import change_type_name
+        from feast.utils import make_tzaware
+
+        def _dt(stamp: Any) -> Optional[datetime]:
+            if stamp is None or (stamp.seconds == 0 and stamp.nanos == 0):
+                return None
+            return make_tzaware(stamp.ToDatetime())
+
+        return {
+            "sequence_number": record.sequence_number,
+            "feature_view_name": record.feature_view_name,
+            "feature_view_type": record.feature_view_type,
+            "fingerprint": record.fingerprint,
+            "previous_fingerprint": record.previous_fingerprint,
+            "logic_changed": record.previous_logic_fingerprint
+            != record.logic_fingerprint,
+            "feature_changes": [
+                {
+                    "feature_name": change.feature_name,
+                    "change_type": change_type_name(change.change_type),
+                    "previous_type": change.previous_type,
+                    "new_type": change.new_type,
+                }
+                for change in record.feature_changes
+            ],
+            "affected_start": _dt(record.affected_start),
+            "affected_end": _dt(record.affected_end),
+            "recorded_at": _dt(record.recorded_at),
+            "baseline_missing": record.baseline_missing,
+        }
+
+    def analyze_definition_change(
+        self,
+        feature_view_name: str,
+        sequence_number: Optional[int] = None,
+    ) -> "ChangeImpact":
+        """Assess the impact of a recorded definition change.
+
+        Args:
+            feature_view_name: The view whose change to analyse.
+            sequence_number: Which recorded change to analyse. Defaults to the
+                most recent one.
+
+        Returns:
+            A :class:`~feast.definition_tracking.ChangeImpact` describing the
+            affected partitions, split into "must recompute" and "can skip",
+            with the reason for each verdict.
+
+        Raises:
+            ValueError: When definition tracking is disabled or no change has
+                been recorded for the view.
+            FingerprintUnavailable: When the recorded metadata is insufficient
+                to decide the affected range. The error explains what is
+                missing; no conclusion is fabricated.
+        """
+        from feast.definition_tracking.tracker import (
+            DefinitionTracker,
+            FingerprintUnavailable,
+        )
+
+        self._require_definition_tracking("analyze_definition_change")
+        partitions_by_view = self._materialization_partitions_by_view()
+        state = self.registry.get_definition_tracking_state(self.project)
+        tracker = DefinitionTracker(
+            self.project, state, materialization_intervals=partitions_by_view
+        )
+
+        records = tracker.records_for(feature_view_name)
+        if not records:
+            raise ValueError(
+                f"No tracked definition changes for '{feature_view_name}' in "
+                f"project '{self.project}'."
+            )
+        if sequence_number is None:
+            record = max(records, key=lambda item: item.sequence_number)
+        else:
+            matches = [
+                item for item in records if item.sequence_number == sequence_number
+            ]
+            if not matches:
+                raise ValueError(
+                    f"No change record #{sequence_number} for '{feature_view_name}'."
+                )
+            record = matches[0]
+
+        definitions_by_view = self._definition_protos_by_view()
+
+        impact = tracker.analyze(
+            record,
+            partitions_by_view=partitions_by_view,
+            definitions_by_view=definitions_by_view,
+        )
+
+        if getattr(self.registry, "require_explicit_partition_provenance", False):
+            # Strict mode: a partition without recorded provenance is an error,
+            # not an "undetermined" note. This is for pipelines that would
+            # rather stop than act on a partial answer.
+            undetermined = impact.undetermined
+            if undetermined:
+                first = undetermined[0]
+                raise FingerprintUnavailable(
+                    f"Cannot determine the impact of change #{impact.sequence_number} "
+                    f"to '{feature_view_name}': {len(undetermined)} partition(s), "
+                    f"starting at [{first.start}, {first.end}], have no recorded "
+                    f"provenance and require_explicit_partition_provenance is set."
+                )
+
+        return impact
+
+    def _materialization_partitions_by_view(
+        self,
+    ) -> Dict[str, List[Tuple[datetime, datetime]]]:
+        """Read materialization intervals for every view from the registry."""
+        partitions: Dict[str, List[Tuple[datetime, datetime]]] = {}
+        for view in self.registry.list_all_feature_views(self.project):
+            intervals = getattr(view, "materialization_intervals", None)
+            if intervals is None:
+                continue
+            # Feast appends an interval on every materialization call, so the
+            # same range can appear more than once (re-runs, resumed jobs).
+            # Impact analysis is per distinct range, not per call.
+            unique: List[Tuple[datetime, datetime]] = []
+            seen: set = set()
+            for interval in intervals:
+                key = (interval[0], interval[1])
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append(key)
+            partitions[view.name] = unique
+        return partitions
+
+    def _definition_protos_by_view(self) -> Dict[str, Any]:
+        protos: Dict[str, Any] = {}
+        for view in self.registry.list_all_feature_views(self.project):
+            try:
+                protos[view.name] = view.to_proto()
+            except Exception:  # pragma: no cover - a view that cannot serialize
+                continue
+        return protos
+
+    def create_recompute_plan(
+        self,
+        feature_view_name: str,
+        sequence_number: Optional[int] = None,
+    ) -> "RecomputePlan":
+        """Create (or fetch) a resumable recompute plan for a recorded change.
+
+        The plan is idempotent: calling this twice for the same change returns
+        the same plan with its existing per-partition progress preserved.
+
+        Raises:
+            ValueError: When definition tracking is disabled or no matching
+                change exists.
+            FingerprintUnavailable: As :meth:`analyze_definition_change`.
+        """
+        from feast.definition_tracking.tracker import DefinitionTracker
+
+        self._require_definition_tracking("create_recompute_plan")
+        impact = self.analyze_definition_change(feature_view_name, sequence_number)
+
+        state = self.registry.get_definition_tracking_state(self.project)
+        tracker = DefinitionTracker(self.project, state)
+        plan = tracker.create_plan(impact)
+        self.registry.save_definition_tracking_state(state, self.project)
+        self.registry.commit_definition_tracking()
+        return plan
+
+    def update_recompute_plan(
+        self,
+        plan_id: str,
+        *,
+        partition_start: datetime,
+        partition_end: datetime,
+        status: str,
+        error: str = "",
+    ) -> None:
+        """Update one partition's status in a recompute plan.
+
+        ``status`` is one of ``pending``, ``running``, ``completed``,
+        ``failed``. Progress is persisted immediately, so an interrupted run can
+        be resumed by re-reading the plan.
+
+        Raises:
+            ValueError: When the plan or partition does not exist.
+        """
+        from feast.definition_tracking.tracker import (
+            DefinitionTracker,
+            PartitionStatus,
+        )
+
+        self._require_definition_tracking("update_recompute_plan")
+        status_map = {
+            "pending": PartitionStatus.RECOMPUTE_PENDING,
+            "running": PartitionStatus.RECOMPUTE_RUNNING,
+            "completed": PartitionStatus.RECOMPUTE_COMPLETED,
+            "failed": PartitionStatus.RECOMPUTE_FAILED,
+        }
+        if status not in status_map:
+            raise ValueError(
+                f"Unknown status '{status}'. Expected one of {sorted(status_map)}."
+            )
+
+        state = self.registry.get_definition_tracking_state(self.project)
+        tracker = DefinitionTracker(self.project, state)
+        plan = next((item for item in state.plans if item.plan_id == plan_id), None)
+        if plan is None:
+            raise ValueError(f"No recompute plan with id '{plan_id}'.")
+        if not tracker.mark_partition(
+            plan,
+            start=partition_start,
+            end=partition_end,
+            status=status_map[status],
+            error=error,
+        ):
+            raise ValueError(
+                f"Plan '{plan_id}' has no partition "
+                f"[{partition_start}, {partition_end}]."
+            )
+        self.registry.save_definition_tracking_state(state, self.project)
+        self.registry.commit_definition_tracking()
+
+    def get_recompute_plan(self, plan_id: str) -> Dict[str, Any]:
+        """Return a recompute plan with its per-partition statuses.
+
+        Raises:
+            ValueError: When definition tracking is disabled, or no plan has
+                this id. The returned ``progress`` counts partitions by status;
+        ``next_pending_partition`` is the interval to resume at (``None`` when
+        the plan is complete).
+        """
+        from feast.definition_tracking.tracker import (
+            DefinitionTracker,
+            PartitionStatus,
+        )
+        from feast.utils import make_tzaware
+
+        self._require_definition_tracking("get_recompute_plan")
+        state = self.registry.get_definition_tracking_state(self.project)
+        tracker = DefinitionTracker(self.project, state)
+        plan = next((item for item in state.plans if item.plan_id == plan_id), None)
+        if plan is None:
+            raise ValueError(f"No recompute plan with id '{plan_id}'.")
+
+        next_pending = tracker.next_pending(plan)
+        return {
+            "plan_id": plan.plan_id,
+            "feature_view_name": plan.feature_view_name,
+            "from_fingerprint": plan.from_fingerprint,
+            "to_fingerprint": plan.to_fingerprint,
+            "change_sequence_number": plan.change_sequence_number,
+            "partitions": [
+                {
+                    "start": make_tzaware(partition.start_time.ToDatetime()),
+                    "end": make_tzaware(partition.end_time.ToDatetime()),
+                    "status": PartitionStatus.Name(partition.status).lower(),
+                    "reason": partition.reason,
+                    "error": partition.error,
+                    "unknown_provenance": partition.unknown_provenance,
+                }
+                for partition in plan.partitions
+            ],
+            "progress": tracker.plan_progress(plan),
+            "next_pending_partition": (
+                (
+                    make_tzaware(next_pending.start_time.ToDatetime()),
+                    make_tzaware(next_pending.end_time.ToDatetime()),
+                )
+                if next_pending is not None
+                else None
+            ),
+        }
+
+    def execute_recompute_plan(self, plan_id: str) -> Dict[str, Any]:
+        """Re-materialize the pending partitions of a recompute plan.
+
+        Each partition is handed to the existing :meth:`materialize` path for
+        its view's interval; the plan's partition status is persisted before
+        and after every step. If the run is interrupted (exception, process
+        exit), completed partitions stay ``completed`` and the next call resumes
+        from ``next_pending_partition`` -- nothing is recomputed twice unless it
+        previously failed.
+
+        The plan's own feature view and every downstream view flagged as
+        ``must recompute`` are processed. Downstream intervals are derived from
+        their recorded partitions; a downstream view that has no tracked
+        partitions is skipped with a note.
+
+        This does not change any feature computation: it only calls
+        ``materialize`` for the affected intervals.
+
+        Returns:
+            A summary dict with ``processed``, ``completed``, ``failed`` and
+            any ``errors``.
+
+        Raises:
+            ValueError: When definition tracking is disabled or the plan does
+                not exist.
+        """
+        from feast.definition_tracking.tracker import (
+            DefinitionTracker,
+            PartitionStatus,
+        )
+        from feast.utils import make_tzaware
+
+        self._require_definition_tracking("execute_recompute_plan")
+        state = self.registry.get_definition_tracking_state(self.project)
+        tracker = DefinitionTracker(self.project, state)
+        plan = next((item for item in state.plans if item.plan_id == plan_id), None)
+        if plan is None:
+            raise ValueError(f"No recompute plan with id '{plan_id}'.")
+
+        results: Dict[str, Any] = {
+            "processed": 0,
+            "completed": 0,
+            "failed": 0,
+            "errors": [],
+        }
+        # Partitions this call has already handled, so a persistently failing
+        # partition cannot spin the loop. A later call retries ``failed`` ones.
+        handled: set = set()
+
+        while True:
+            pending = self._next_unhandled_partition(
+                tracker, plan, handled, PartitionStatus
+            )
+            if pending is None:
+                break
+            handled.add(
+                (
+                    pending.start_time.seconds,
+                    pending.start_time.nanos,
+                    pending.end_time.seconds,
+                    pending.end_time.nanos,
+                )
+            )
+
+            start = make_tzaware(pending.start_time.ToDatetime())
+            end = make_tzaware(pending.end_time.ToDatetime())
+            view_name = self._plan_partition_view(pending, plan.feature_view_name)
+
+            tracker.mark_partition(
+                plan, start=start, end=end, status=PartitionStatus.RECOMPUTE_RUNNING
+            )
+            self._persist_plan_progress(state)
+
+            try:
+                self.materialize(
+                    start_date=start, end_date=end, feature_views=[view_name]
+                )
+            except Exception as exc:  # noqa: BLE001 - recorded, then reported
+                results["failed"] += 1
+                results["errors"].append(
+                    {"feature_view": view_name, "start": start, "error": str(exc)}
+                )
+                tracker.mark_partition(
+                    plan,
+                    start=start,
+                    end=end,
+                    status=PartitionStatus.RECOMPUTE_FAILED,
+                    error=str(exc),
+                )
+                self._persist_plan_progress(state)
+                continue
+
+            results["processed"] += 1
+            results["completed"] += 1
+            tracker.mark_partition(
+                plan,
+                start=start,
+                end=end,
+                status=PartitionStatus.RECOMPUTE_COMPLETED,
+            )
+            self._persist_plan_progress(state)
+
+        return results
+
+    @staticmethod
+    def _next_unhandled_partition(
+        tracker: Any, plan: Any, handled: set, partition_status: Any
+    ) -> Any:
+        retryable = (
+            partition_status.RECOMPUTE_PENDING,
+            partition_status.RECOMPUTE_RUNNING,
+            partition_status.RECOMPUTE_FAILED,
+        )
+        for partition in plan.partitions:
+            key = (
+                partition.start_time.seconds,
+                partition.start_time.nanos,
+                partition.end_time.seconds,
+                partition.end_time.nanos,
+            )
+            if partition.status in retryable and key not in handled:
+                return partition
+        return None
+
+    def _persist_plan_progress(self, state: Any) -> None:
+        # ``materialize`` may write tracking state (partition provenance) on the
+        # same registry between steps. Re-read the latest state and merge only
+        # what this plan changed, so a stale in-memory copy cannot clobber it.
+        latest = self.registry.get_definition_tracking_state(self.project)
+        self._merge_plan_state(latest, state)
+        self.registry.save_definition_tracking_state(latest, self.project)
+        self.registry.commit_definition_tracking()
+
+    @staticmethod
+    def _merge_plan_state(target: Any, source: Any) -> None:
+        """Copy plan partitions from ``source`` onto ``target`` in place.
+
+        Non-plan tracking data on ``target`` (new change records, partition
+        provenance) is left untouched.
+        """
+        target_plans = {plan.plan_id: plan for plan in target.plans}
+        for source_plan in source.plans:
+            target_plan = target_plans.get(source_plan.plan_id)
+            if target_plan is None:
+                target_plan = target.plans.add()
+                target_plan.CopyFrom(source_plan)
+                continue
+            target_plan.updated_at.CopyFrom(source_plan.updated_at)
+            for index, partition in enumerate(source_plan.partitions):
+                if index < len(target_plan.partitions):
+                    target_plan.partitions[index].CopyFrom(partition)
+
+    @staticmethod
+    def _plan_partition_view(partition: Any, default_view: str) -> str:
+        """Extract the view a plan partition belongs to.
+
+        Downstream partitions are recorded with a ``[view]`` prefix. This keeps
+        the plan flat (one status list) while retaining which view each range
+        belongs to.
+        """
+        reason = partition.reason or ""
+        if reason.startswith("[") and "]" in reason:
+            return reason[1 : reason.index("]")]
+        return default_view
 
     def get_stream_feature_view(
         self, name: str, allow_registry_cache: bool = False

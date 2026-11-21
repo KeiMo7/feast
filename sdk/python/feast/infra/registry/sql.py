@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Union, cast
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union, cast
 
 from pydantic import StrictInt, StrictStr, field_validator
 from sqlalchemy import (  # type: ignore
@@ -271,6 +271,17 @@ Index(
     feature_view_version_history.c.project_id,
 )
 
+# Opt-in definition-tracking state, one serialized blob per project. Kept in a
+# per-project row (not in the shared registry proto) so concurrent writers only
+# touch their own project's tracking state.
+definition_tracking = Table(
+    "definition_tracking",
+    metadata,
+    Column("project_id", String(255), primary_key=True),
+    Column("last_updated_timestamp", BigInteger, nullable=False),
+    Column("definition_tracking_proto", ProtoBytes, nullable=False),
+)
+
 
 class FeastMetadataKeys(Enum):
     LAST_UPDATED_TIMESTAMP = "last_updated_timestamp"
@@ -378,6 +389,14 @@ class SqlRegistry(CachingRegistry):
         )
         self.serve_features_while_materializing = (
             registry_config.serve_features_while_materializing
+        )
+        tracking_config = getattr(registry_config, "definition_tracking", None)
+        self.definition_tracking_enabled = bool(
+            tracking_config is not None and tracking_config.enabled
+        )
+        self.require_explicit_partition_provenance = bool(
+            tracking_config is not None
+            and getattr(tracking_config, "require_explicit_partition_provenance", False)
         )
         super().__init__(
             project=project,
@@ -551,6 +570,7 @@ class SqlRegistry(CachingRegistry):
             permissions,
             feature_view_version_history,
             label_views,
+            definition_tracking,
         }:
             with self.write_engine.begin() as conn:
                 stmt = delete(t)
@@ -853,6 +873,24 @@ class SqlRegistry(CachingRegistry):
         )
 
     def apply_feature_view(
+        self,
+        feature_view: BaseFeatureView,
+        project: str,
+        commit: bool = True,
+        no_promote: bool = False,
+    ):
+        previous = (
+            self._tracking_active_definition(feature_view.name, project)
+            if self.definition_tracking_enabled
+            else None
+        )
+        self._apply_feature_view_impl(
+            feature_view, project, commit=commit, no_promote=no_promote
+        )
+        if self.definition_tracking_enabled:
+            self._record_definition_change(feature_view, project, previous)
+
+    def _apply_feature_view_impl(
         self,
         feature_view: BaseFeatureView,
         project: str,
@@ -1257,6 +1295,22 @@ class SqlRegistry(CachingRegistry):
         end_date: datetime,
         commit: bool = True,
     ):
+        self._apply_materialization_impl(
+            feature_view, project, start_date, end_date, commit=commit
+        )
+        if self.definition_tracking_enabled and not isinstance(feature_view, LabelView):
+            self._record_materialized_partition(
+                feature_view, project, start_date, end_date
+            )
+
+    def _apply_materialization_impl(
+        self,
+        feature_view: Union[FeatureView, OnDemandFeatureView, LabelView],
+        project: str,
+        start_date: datetime,
+        end_date: datetime,
+        commit: bool = True,
+    ):
         table = self._infer_fv_table(feature_view)
         python_class, proto_class = self._infer_fv_classes(feature_view)
 
@@ -1409,6 +1463,176 @@ class SqlRegistry(CachingRegistry):
             return OnDemandFeatureViewProto, OnDemandFeatureView
         else:
             raise ValueError(f"Unknown feature view type: {fv_type}")
+
+    # ---------------------------------------------------- definition tracking
+
+    def get_definition_tracking_state(self, project: Optional[str] = None) -> Any:
+        """Load ``project``'s tracking state from its own row."""
+        from feast.protos.feast.core.DefinitionTracking_pb2 import (
+            DefinitionTrackingState,
+        )
+        from feast.protos.feast.core.DefinitionTracking_pb2 import (
+            DefinitionTrackingState as StateProto,
+        )
+
+        project = self._resolve_tracking_project(project)
+        with self.read_engine.begin() as conn:
+            stmt = select(definition_tracking).where(
+                definition_tracking.c.project_id == project
+            )
+            row = conn.execute(stmt).first()
+        if not row:
+            return DefinitionTrackingState()
+        return StateProto.FromString(row._mapping["definition_tracking_proto"])
+
+    def _resolve_tracking_project(self, project: Optional[str]) -> str:
+        resolved = project or getattr(self, "_definition_tracking_project", None)
+        if resolved is None:
+            raise RuntimeError("Definition tracking state was read without a project.")
+        return resolved
+
+    def _tracking_materialization_intervals(
+        self, project: str
+    ) -> Dict[str, List[Tuple[datetime, datetime]]]:
+        from feast.utils import make_tzaware
+
+        intervals: Dict[str, List[Tuple[datetime, datetime]]] = {}
+        for table in (
+            feature_views,
+            stream_feature_views,
+            on_demand_feature_views,
+            label_views,
+        ):
+            for view in self._list_objects(
+                table,
+                project,
+                proto_class=FeatureViewProto,
+                python_class=FeatureView,
+                proto_field_name="feature_view_proto",
+                proto_only=True,
+            ):
+                raw_intervals = getattr(view.meta, "materialization_intervals", [])
+                intervals[view.spec.name] = [
+                    (
+                        make_tzaware(item.start_time.ToDatetime()),
+                        make_tzaware(item.end_time.ToDatetime()),
+                    )
+                    for item in raw_intervals
+                ]
+        return intervals
+
+    def _tracking_active_definition(
+        self, name: str, project: str
+    ) -> Optional[Tuple[bytes, Optional[int]]]:
+        self._definition_tracking_project = project
+        try:
+            active = self._get_any_feature_view(name, project)
+        except FeatureViewNotFoundException:
+            return None
+        version_number = getattr(active, "current_version_number", None)
+        return active.to_proto().SerializeToString(), version_number
+
+    def _record_definition_change(
+        self,
+        feature_view: BaseFeatureView,
+        project: str,
+        previous: Optional[Tuple[bytes, Optional[int]]],
+    ) -> None:
+        from feast.definition_tracking.tracker import DefinitionTracker
+
+        self._definition_tracking_project = project
+        state = self.get_definition_tracking_state(project)
+        tracker = DefinitionTracker(
+            project,
+            state,
+            materialization_intervals=self._tracking_materialization_intervals(project),
+        )
+
+        previous_proto = None
+        previous_version = None
+        if previous is not None:
+            previous_bytes, previous_version = previous
+            proto_class, _ = self._proto_class_for_type(
+                self._infer_fv_type_string(feature_view)
+            )
+            previous_proto = proto_class.FromString(previous_bytes)
+
+        record = tracker.record_apply(
+            feature_view_name=feature_view.name,
+            feature_view_type=self._infer_fv_type_string(feature_view),
+            current_proto=feature_view.to_proto(),
+            previous_proto=previous_proto,
+            version_number=getattr(feature_view, "current_version_number", None),
+            previous_version_number=previous_version,
+        )
+        if record is not None:
+            self._save_definition_tracking_state(project, state)
+
+    def _record_materialized_partition(
+        self,
+        feature_view: Union[FeatureView, OnDemandFeatureView, LabelView],
+        project: str,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> None:
+        from feast.definition_tracking import fingerprint as fp
+        from feast.definition_tracking.tracker import DefinitionTracker
+
+        self._definition_tracking_project = project
+        try:
+            active = self._get_any_feature_view(feature_view.name, project)
+        except FeatureViewNotFoundException:
+            return
+        active_proto = active.to_proto()
+
+        state = self.get_definition_tracking_state(project)
+        tracker = DefinitionTracker(project, state)
+        tracker.record_partition(
+            feature_view_name=feature_view.name,
+            start=start_date,
+            end=end_date,
+            fingerprint=fp.definition_fingerprint(active_proto),
+            logic_fingerprint=fp.logic_fingerprint(active_proto),
+            version_number=getattr(active, "current_version_number", None),
+        )
+        self._save_definition_tracking_state(project, state)
+
+    def save_definition_tracking_state(
+        self, state: Any, project: Optional[str] = None
+    ) -> None:
+        self._save_definition_tracking_state(
+            self._resolve_tracking_project(project), state
+        )
+
+    def _save_definition_tracking_state(self, project: str, state: Any) -> None:
+        payload = state.SerializeToString()
+        now = int(_utc_now().timestamp())
+        with self.write_engine.begin() as conn:
+            stmt = select(definition_tracking).where(
+                definition_tracking.c.project_id == project
+            )
+            row = conn.execute(stmt).first()
+            if row:
+                conn.execute(
+                    update(definition_tracking)
+                    .where(definition_tracking.c.project_id == project)
+                    .values(
+                        last_updated_timestamp=now,
+                        definition_tracking_proto=payload,
+                    )
+                )
+            else:
+                conn.execute(
+                    insert(definition_tracking).values(
+                        project_id=project,
+                        last_updated_timestamp=now,
+                        definition_tracking_proto=payload,
+                    )
+                )
+
+    def commit_definition_tracking(self) -> None:
+        # Writes are eager; nothing to flush.
+        return None
 
     def _get_next_version_number(self, name: str, project: str) -> int:
         with self.write_engine.begin() as conn:

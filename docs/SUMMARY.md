@@ -185,6 +185,7 @@
   * [Snowflake](reference/registries/snowflake.md)
   * [HDFS](reference/registries/hdfs.md)
   * [Remote](reference/registries/remote.md)
+  * [Definition change tracking](reference/registries/definition-tracking.md)
   * [Registry permissions](reference/registry/registry-permissions.md)
 * [Providers](reference/providers/README.md)
   * [Local](reference/providers/local.md)
