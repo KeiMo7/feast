@@ -579,3 +579,32 @@ class FeastPermissionError(FeastError, PermissionError):
 
     def http_status_code(self) -> int:
         return HttpStatusCode.HTTP_403_FORBIDDEN
+
+
+class ConsistencyValidationError(FeastError):
+    """Base class for errors raised by offline/online feature consistency validation."""
+
+
+class EmptyConsistencyDatasetError(ConsistencyValidationError):
+    """Raised when the consistency validation input dataset contains no entity rows.
+
+    A zero-row dataset cannot prove anything about consistency; returning a report
+    with a zero mismatch rate from it would be a false pass.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Consistency validation requires at least one entity row with an "
+            "event_timestamp, but the input dataset is empty."
+        )
+
+
+class ConsistencyTimestampColumnMissingError(ConsistencyValidationError):
+    """Raised when the validation entity dataframe has no event_timestamp column."""
+
+    def __init__(self, columns: List[str]):
+        super().__init__(
+            "Consistency validation requires an 'event_timestamp' column "
+            "(event time, never processing time) in the entity dataframe. "
+            f"Columns found: {columns}"
+        )

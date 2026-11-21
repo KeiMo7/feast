@@ -218,6 +218,7 @@
 * [\[Alpha\] OpenAI-Compatible Vector Store API](reference/alpha-vector-database.md#alpha-openai-compatible-vector-store-api)
 
 * [Data Quality Monitoring](reference/dqm.md)
+* [Offline/Online Feature Consistency Validation](reference/feature-consistency.md)
 * [\[Deprecated\] Data quality monitoring (Great Expectations)](reference/dqm.md)
 * [\[Alpha\] Streaming feature computation with Denormalized](reference/denormalized.md)
 * [\[Alpha\] Feature View Versioning](reference/alpha-feature-view-versioning.md)

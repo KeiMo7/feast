@@ -25,6 +25,7 @@ from dateutil import parser
 from pygments import formatters, highlight, lexers
 
 from feast import utils
+from feast.cli.consistency import validate_consistency_cmd
 from feast.cli.data_sources import data_sources_cmd
 from feast.cli.dbt_import import dbt_cmd
 from feast.cli.entities import entities_cmd
@@ -641,6 +642,7 @@ cli.add_command(feature_views_cmd)
 cli.add_command(features_cmd)
 cli.add_command(get_historical_features)
 cli.add_command(get_online_features)
+cli.add_command(validate_consistency_cmd)
 cli.add_command(on_demand_feature_views_cmd)
 cli.add_command(feast_permissions_cmd)
 cli.add_command(projects_cmd)

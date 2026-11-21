@@ -37,6 +37,10 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from feast.consistency import (
+        ConsistencyReport,
+        ConsistencyValidationConfig,
+    )
     from feast.diff.apply_progress import ApplyProgressContext
     from feast.embedder import EmbeddingProvider
 
@@ -3780,6 +3784,80 @@ class FeatureStore:
             df = self._transform_on_demand_feature_view_df(feature_view, df)
 
         return feature_view, df
+
+    def validate_feature_consistency(
+        self,
+        entity_df: pd.DataFrame,
+        features: Union[List[str], "FeatureService"],
+        config: Optional["ConsistencyValidationConfig"] = None,
+        full_feature_names: bool = False,
+    ) -> "ConsistencyReport":
+        """Validate offline point-in-time feature values against online-served values.
+
+        For every entity row and requested feature, the value produced by the
+        offline point-in-time join (:meth:`get_historical_features`) is
+        compared with the latest online-served value
+        (:meth:`get_online_features`) under explicit tolerances, and every
+        mismatch is attributed to a reason category (out of retention,
+        online unavailable, value missing, window mismatch, batch/stream
+        semantic difference, type conversion difference, or plain value
+        mismatch).
+
+        This is an additive validation entry point: it does not modify
+        feature computation, existing retrieval interfaces, or online-store
+        contents unless ``ConsistencyValidationConfig.prepare_online_store``
+        is explicitly enabled. When validation is not invoked, Feast behaves
+        exactly as before.
+
+        Time semantics: ``entity_df.event_timestamp`` is event time and is
+        the only timestamp used for the offline join and TTL checks. The
+        online store serves its latest value regardless of event time; its
+        per-cell ``FieldStatus`` (``PRESENT``, ``NULL_VALUE``, ``NOT_FOUND``,
+        ``OUTSIDE_MAX_AGE``) is recorded as evidence. Event time and
+        processing/wall-clock time are never interchanged.
+
+        Args:
+            entity_df: Entity rows to validate. Must contain every join key
+                of the requested feature views and an ``event_timestamp``
+                column. An empty dataframe raises
+                ``EmptyConsistencyDatasetError`` rather than producing a
+                false zero-mismatch report.
+            features: Feature references (``"view:feature"``) or a
+                ``FeatureService``.
+            config: Tolerances and limits; defaults to
+                :class:`~feast.consistency.ConsistencyValidationConfig`.
+            full_feature_names: If True, use ``view__feature`` naming in the
+                report, matching the retrieval naming convention.
+
+        Returns:
+            A :class:`~feast.consistency.ConsistencyReport` with the
+            mismatch rate (numerator/denominator defined per cell),
+            per-feature statistics, reason breakdowns, and evidence samples.
+            Reports from sharded runs are mergeable via
+            :meth:`ConsistencyReport.merge`.
+        """
+        from feast.consistency import validate_feature_consistency as _validate
+
+        feature_refs = self._features_to_refs(features)
+        return _validate(
+            store=self,
+            entity_df=entity_df,
+            features=feature_refs,
+            config=config,
+            full_feature_names=full_feature_names,
+        )
+
+    @staticmethod
+    def _features_to_refs(
+        features: Union[List[str], "FeatureService"],
+    ) -> List[str]:
+        if isinstance(features, FeatureService):
+            return [
+                f"{projection.name}:{feature.name}"
+                for projection in features.feature_view_projections
+                for feature in projection.features
+            ]
+        return list(features)
 
     def write_to_online_store(
         self,

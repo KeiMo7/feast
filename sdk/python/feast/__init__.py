@@ -19,6 +19,12 @@ from feast.infra.offline_stores.snowflake_source import SnowflakeSource
 from .aggregation import Aggregation
 from .batch_feature_view import BatchFeatureView
 from .chunker import BaseChunker, ChunkingConfig, TextChunker
+from .consistency import (
+    ConsistencyMismatch,
+    ConsistencyReport,
+    ConsistencyValidationConfig,
+    MismatchReason,
+)
 from .data_source import KafkaSource, KinesisSource, PushSource, RequestSource
 from .dataframe import DataFrameEngine, FeastDataFrame
 from .doc_embedder import DocEmbedder, SchemaTransformFn
@@ -55,6 +61,12 @@ __all__ = [
     "Aggregation",
     "BatchFeatureView",
     "copy_demo_notebooks",
+    "ChunkingConfig",
+    "TextChunker",
+    "ConsistencyMismatch",
+    "ConsistencyReport",
+    "ConsistencyValidationConfig",
+    "MismatchReason",
     "DataFrameEngine",
     "Entity",
     "KafkaSource",

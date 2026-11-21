@@ -328,6 +328,31 @@ For a regular feature view with no previous materialization, the start date is t
 feast materialize-incremental 2022-01-01T00:00:00
 ```
 
+## Validate feature consistency
+
+Compare offline point-in-time feature values against online-served values for
+the same entities and event times, and print the mismatch rate plus reason
+counts. See [Offline/Online Feature Consistency Validation](feature-consistency.md)
+for the full semantics and the mismatch-rate definition.
+
+The entity dataset (Parquet or CSV) must contain every required join key and
+an `event_timestamp` column. An empty dataset errors instead of reporting a
+zero mismatch rate.
+
+```bash
+feast validate-consistency \
+  --entity-df validation_entities.parquet \
+  --features driver_stats:conv_rate \
+  --features driver_stats:avg_daily_trips \
+  --output consistency_report.json
+```
+
+Key options: `--float-rtol` / `--float-atol` (comparison tolerances, defaults
+`1e-5` / `1e-8`), `--batch-size` (rows per online read, default `1000`),
+`--max-samples` (evidence records retained, default `100`),
+`--prepare-online-store` (materialize before validating; off by default so the
+run is read-only), and `--full-feature-names`.
+
 ## Permissions
 
 ### List permissions
