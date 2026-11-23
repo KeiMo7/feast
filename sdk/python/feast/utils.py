@@ -1852,6 +1852,7 @@ def _populate_response_from_feature_data(
     table: "FeatureView",
     output_len: int,
     include_feature_view_version_metadata: bool = False,
+    emit_metrics: bool = True,
 ):
     """Populate the GetOnlineFeaturesResponse from raw online_read rows.
 
@@ -1865,6 +1866,9 @@ def _populate_response_from_feature_data(
         read_rows: Raw output from ``OnlineStore.online_read`` — a list of
             ``(event_timestamp, feature_dict)`` tuples, one per unique entity.
             ``feature_dict`` may be ``None`` when the entity is not found.
+            Rows whose ``feature_dict`` is not a dict (e.g. a read-failure
+            sentinel from the status-tracking read path) are treated like
+            ``None`` so the response still contains null values for them.
         indexes: A tuple of lists that maps each unique entity (by position
             in ``read_rows``) to one or more output positions in the response.
             Used to fan-out deduplicated reads back to the original request rows.
@@ -1875,6 +1879,9 @@ def _populate_response_from_feature_data(
         output_len: Total number of result rows in the response.
         include_feature_view_version_metadata: If True, version metadata
             for the feature view is added to the response.
+        emit_metrics: If False, skip the built-in PRESENT/NOT_FOUND metric
+            emission (the caller emits finer-grained per-reason metrics
+            instead).
     """
     n_features = len(requested_features)
 
@@ -1928,7 +1935,9 @@ def _populate_response_from_feature_data(
     _outside_max_age_count = 0
     for row_idx, destinations in enumerate(indexes_tuple):
         row_ts, feature_data = read_rows[row_idx]
-        if feature_data is None:
+        if feature_data is None or not isinstance(feature_data, dict):
+            # Entity not found, or a read-failure sentinel row from the
+            # status-tracking read path: leave null values in place.
             continue
         # Expired values are still returned; only the status changes.
         expired = (
@@ -1950,15 +1959,18 @@ def _populate_response_from_feature_data(
         else:
             _present_count += _row_count
 
-    try:
-        from feast.metrics import track_feature_statuses
+    if emit_metrics:
+        try:
+            from feast.metrics import track_feature_statuses
 
-        _not_found = (n_features * output_len) - _present_count - _outside_max_age_count
-        track_feature_statuses(
-            table.name, _present_count, _not_found, _outside_max_age_count
-        )
-    except Exception:
-        pass
+            _not_found = (
+                (n_features * output_len) - _present_count - _outside_max_age_count
+            )
+            track_feature_statuses(
+                table.name, _present_count, _not_found, _outside_max_age_count
+            )
+        except Exception:
+            pass
 
     for f_idx in range(n_features):
         online_features_response.results.append(

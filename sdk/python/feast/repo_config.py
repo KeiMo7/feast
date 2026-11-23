@@ -295,6 +295,40 @@ class RegistryConfig(FeastBaseModel):
         return self
 
 
+class OnlineStatusConfig(FeastConfigBaseModel):
+    """Configuration for per-row, per-feature online value status tracking.
+
+    Disabled by default; when disabled the online response is byte-for-byte
+    identical to the current behavior.
+    """
+
+    enabled: StrictBool = False
+    """ bool: If true, every get_online_features call also produces an
+        OnlineStatusReport explaining why each value is present or missing. """
+
+    fill_defaults: StrictBool = False
+    """ bool: If true, fillable missing values (entity not found, feature never
+        materialized, null value, unsupported type, unregistered view, store
+        unavailable) are replaced with defaults in the returned values. The
+        original status is always preserved in the status report. """
+
+    defaults: Dict[str, Any] = Field(default_factory=dict)
+    """ dict: Optional per-feature default overrides, keyed by result column
+        name (e.g. "lat" or "driver_locations__lat"). Features without an
+        override fall back to a type-appropriate zero value. """
+
+    read_batch_size: Optional[int] = Field(default=None, gt=0)
+    """ int: If set, split each feature view's online read into batches of at
+        most this many entity keys, so one failing batch does not take down
+        the whole request. If None (default), reads are issued exactly as
+        today (one read per feature view). """
+
+    max_batch_retries: int = Field(default=2, ge=0)
+    """ int: Maximum number of retries per failed read batch. After the cap is
+        exceeded the batch's rows are marked store_unavailable and the batch
+        is listed in the report's failed_batches. """
+
+
 class MaterializationConfig(BaseModel):
     """Configuration options for feature materialization behavior."""
 
@@ -529,6 +563,11 @@ class RepoConfig(FeastBaseModel):
         MaterializationConfig(), alias="materialization"
     )
     """ MaterializationConfig: Configuration options for feature materialization behavior. """
+
+    online_status_config: OnlineStatusConfig = Field(
+        OnlineStatusConfig(), alias="online_status"
+    )
+    """ OnlineStatusConfig: Per-row, per-feature online value status tracking (opt-in). """
 
     openlineage_config: Optional[OpenLineageConfig] = Field(None, alias="openlineage")
     """ Configuration for OpenLineage data lineage integration (optional). """

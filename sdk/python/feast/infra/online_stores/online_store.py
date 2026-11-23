@@ -22,7 +22,7 @@ from google.protobuf.timestamp_pb2 import Timestamp
 
 from feast import Entity, utils
 from feast.batch_feature_view import BatchFeatureView
-from feast.errors import VersionedOnlineReadNotSupported
+from feast.errors import FeastObjectNotFoundException, VersionedOnlineReadNotSupported
 from feast.feature_service import FeatureService
 from feast.feature_view import FeatureView
 from feast.filter_models import ComparisonFilter, CompoundFilter
@@ -30,7 +30,21 @@ from feast.infra.infra_object import InfraObject
 from feast.infra.registry.base_registry import BaseRegistry
 from feast.infra.supported_async_methods import SupportedAsyncMethods
 from feast.online_response import OnlineResponse
+from feast.online_status import (
+    FailedBatch,
+    FeatureViewStatusBlock,
+    OnlineStatusReport,
+    StoreReadFailure,
+    apply_default_fills,
+    compute_feature_view_statuses,
+    count_statuses,
+    unregistered_feature_block,
+)
 from feast.protos.feast.core.Registry_pb2 import Registry as RegistryProto
+from feast.protos.feast.serving.ServingService_pb2 import (
+    FieldStatus,
+    GetOnlineFeaturesResponse,
+)
 from feast.protos.feast.types.EntityKey_pb2 import EntityKey as EntityKeyProto
 from feast.protos.feast.types.Value_pb2 import RepeatedValue
 from feast.protos.feast.types.Value_pb2 import Value as ValueProto
@@ -178,6 +192,23 @@ class OnlineStore(ABC):
 
             entity_rows = columnar
 
+        status_cfg = getattr(config, "online_status_config", None)
+        status_enabled = bool(status_cfg and status_cfg.enabled)
+
+        unregistered_refs: List[Tuple[str, str]] = []
+        if status_enabled and isinstance(features, list):
+            features, unregistered_refs = _partition_unregistered_features(
+                registry, project, features
+            )
+            if not features:
+                # Every requested feature view is unregistered: no online
+                # read is possible, but the response still carries the
+                # entity columns plus null columns for the requested
+                # features, each flagged in the status report.
+                return self._build_all_unregistered_response(
+                    entity_rows, unregistered_refs, full_feature_names
+                )
+
         (
             join_key_values,
             grouped_refs,
@@ -193,6 +224,13 @@ class OnlineStore(ABC):
             entity_values=entity_rows,
             full_feature_names=full_feature_names,
             native_entity_values=True,
+        )
+
+        # Snapshot token of the registry the feature views were resolved
+        # from; re-checked after the reads to detect the registry changing
+        # underneath this request.
+        registry_token_before = (
+            _registry_snapshot_token(registry) if status_enabled else None
         )
 
         # Check for versioned reads on unsupported stores
@@ -251,16 +289,32 @@ class OnlineStore(ABC):
                     f"populate vectors."
                 )
 
+        status_blocks: List[FeatureViewStatusBlock] = []
+        failed_batches: List[FailedBatch] = []
         if not precomputed_ok:
-            self._read_features_per_fv(
-                config,
-                grouped_refs,
-                join_key_values,
-                entity_name_to_join_key_map,
-                online_features_response,
-                full_feature_names,
-                include_feature_view_version_metadata,
-            )
+            if status_enabled:
+                assert status_cfg is not None  # implied by status_enabled
+                status_blocks, failed_batches = self._read_features_per_fv_status(
+                    config,
+                    grouped_refs,
+                    join_key_values,
+                    entity_name_to_join_key_map,
+                    online_features_response,
+                    full_feature_names,
+                    include_feature_view_version_metadata,
+                    read_batch_size=status_cfg.read_batch_size,
+                    max_batch_retries=status_cfg.max_batch_retries,
+                )
+            else:
+                self._read_features_per_fv(
+                    config,
+                    grouped_refs,
+                    join_key_values,
+                    entity_name_to_join_key_map,
+                    online_features_response,
+                    full_feature_names,
+                    include_feature_view_version_metadata,
+                )
 
         if _track_read:
             from feast.metrics import track_online_store_read
@@ -281,7 +335,56 @@ class OnlineStore(ABC):
         utils._drop_unneeded_columns(
             online_features_response, requested_result_row_names
         )
-        return OnlineResponse(online_features_response, feature_types=feature_types)
+
+        if not status_enabled:
+            return OnlineResponse(online_features_response, feature_types=feature_types)
+
+        # --- status side-car assembly (opt-in path) ---
+        num_rows = _entity_row_count(entity_rows)
+        for view_name, feature_name in unregistered_refs:
+            column = (
+                f"{view_name}__{feature_name}" if full_feature_names else feature_name
+            )
+            _append_null_column(online_features_response, column, num_rows)
+            block = unregistered_feature_block(view_name, [column], num_rows)
+            status_blocks.append(block)
+            _track_status_metrics_safely(view_name, count_statuses(block))
+
+        registry_token_after = _registry_snapshot_token(registry)
+        version_mismatch = (
+            registry_token_before is not None
+            and registry_token_after is not None
+            and registry_token_before != registry_token_after
+        )
+        if version_mismatch:
+            logger.warning(
+                "Registry snapshot changed during online feature retrieval; "
+                "registry metadata and online data may come from different "
+                "versions (token %s -> %s)",
+                registry_token_before,
+                registry_token_after,
+            )
+
+        report = OnlineStatusReport(
+            blocks=status_blocks,
+            failed_batches=failed_batches,
+            registry_version_mismatch=version_mismatch,
+        )
+
+        if status_cfg is not None and status_cfg.fill_defaults:
+            apply_default_fills(
+                online_features_response,
+                report,
+                feature_types,
+                status_cfg.defaults,
+            )
+            report.defaults_filled = True
+
+        return OnlineResponse(
+            online_features_response,
+            feature_types=feature_types,
+            status_report=report,
+        )
 
     _versioned_read_supported: Optional[bool] = None
 
@@ -365,6 +468,163 @@ class OnlineStore(ABC):
                 output_len,
                 include_feature_view_version_metadata,
             )
+
+    def _read_features_per_fv_status(
+        self,
+        config: RepoConfig,
+        grouped_refs: List,
+        join_key_values: Dict,
+        entity_name_to_join_key_map: Dict,
+        online_features_response,
+        full_feature_names: bool,
+        include_feature_view_version_metadata: bool,
+        read_batch_size: Optional[int],
+        max_batch_retries: int,
+    ) -> Tuple[List[FeatureViewStatusBlock], List[FailedBatch]]:
+        """Status-tracking variant of :meth:`_read_features_per_fv`.
+
+        Reads each feature view (optionally in configured batches with
+        bounded retries), classifies every (row, feature) from the same
+        registry snapshot and the same read rows, and emits per-reason
+        metrics. A batch that exhausts its retries is marked
+        ``store_unavailable`` for its rows — never ``not_found`` — and is
+        listed in the returned ``failed_batches``; all other batches and
+        feature views are still returned.
+        """
+        status_blocks: List[FeatureViewStatusBlock] = []
+        failed_batches: List[FailedBatch] = []
+
+        for table, requested_features in grouped_refs:
+            table_entity_values, idxs, output_len = utils._get_unique_entities(
+                table, join_key_values, entity_name_to_join_key_map
+            )
+            entity_key_protos = utils._get_entity_key_protos(table_entity_values)
+            n_keys = len(entity_key_protos)
+
+            if read_batch_size and read_batch_size > 0:
+                spans = [
+                    (start, min(start + read_batch_size, n_keys))
+                    for start in range(0, n_keys, read_batch_size)
+                ]
+            else:
+                spans = [(0, n_keys)] if n_keys else []
+
+            read_rows: List[Any] = [None] * n_keys
+            for batch_index, (start, end) in enumerate(spans):
+                batch_keys = entity_key_protos[start:end]
+                attempts = 0
+                rows: List[Any] = []
+                while True:
+                    try:
+                        rows = self.online_read(
+                            config=config,
+                            table=table,
+                            entity_keys=batch_keys,
+                            requested_features=requested_features,
+                        )
+                        break
+                    except Exception as exc:
+                        attempts += 1
+                        if attempts > max_batch_retries:
+                            # Log only metadata — never entity keys or
+                            # feature values.
+                            logger.warning(
+                                "Online read batch failed after %d attempt(s); "
+                                "marking rows store_unavailable "
+                                "(feature_view=%s, batch=%d, rows=%d, error_type=%s)",
+                                attempts,
+                                table.name,
+                                batch_index,
+                                len(batch_keys),
+                                type(exc).__name__,
+                            )
+                            failed_batches.append(
+                                FailedBatch(
+                                    feature_view=table.name,
+                                    batch_index=batch_index,
+                                    row_count=len(batch_keys),
+                                    attempts=attempts,
+                                    error_type=type(exc).__name__,
+                                )
+                            )
+                            rows = [
+                                (None, StoreReadFailure(attempts, type(exc).__name__))
+                            ] * len(batch_keys)
+                            break
+                        logger.info(
+                            "Online read batch attempt %d failed; retrying "
+                            "(feature_view=%s, batch=%d, error_type=%s)",
+                            attempts,
+                            table.name,
+                            batch_index,
+                            type(exc).__name__,
+                        )
+                read_rows[start:end] = rows
+
+            utils._populate_response_from_feature_data(
+                requested_features,
+                read_rows,
+                idxs,
+                online_features_response,
+                full_feature_names,
+                table,
+                output_len,
+                include_feature_view_version_metadata,
+                emit_metrics=False,
+            )
+
+            block = compute_feature_view_statuses(
+                table,
+                requested_features,
+                read_rows,
+                idxs,
+                output_len,
+                full_feature_names,
+            )
+            status_blocks.append(block)
+            _track_status_metrics_safely(table.name, count_statuses(block))
+
+        return status_blocks, failed_batches
+
+    def _build_all_unregistered_response(
+        self,
+        entity_rows: Mapping[str, Any],
+        unregistered_refs: List[Tuple[str, str]],
+        full_feature_names: bool,
+    ) -> OnlineResponse:
+        """Response for the degenerate case: no requested view is registered.
+
+        Echoes the entity columns (as the normal path does for join keys)
+        and appends a null column per requested feature, each flagged
+        ``feature_view_not_registered`` in the status report.
+        """
+        from feast.type_map import python_values_to_proto_values
+
+        num_rows = _entity_row_count(entity_rows)
+        online_features_response = GetOnlineFeaturesResponse(results=[])
+        entity_data = {
+            k: python_values_to_proto_values(list(v), ValueType.UNKNOWN)
+            for k, v in entity_rows.items()
+        }
+        utils._populate_result_rows_from_columnar(
+            online_features_response=online_features_response,
+            data=entity_data,
+        )
+
+        blocks: List[FeatureViewStatusBlock] = []
+        for view_name, feature_name in unregistered_refs:
+            column = (
+                f"{view_name}__{feature_name}" if full_feature_names else feature_name
+            )
+            _append_null_column(online_features_response, column, num_rows)
+            block = unregistered_feature_block(view_name, [column], num_rows)
+            blocks.append(block)
+            _track_status_metrics_safely(view_name, count_statuses(block))
+
+        return OnlineResponse(
+            online_features_response,
+            status_report=OnlineStatusReport(blocks=blocks),
+        )
 
     async def _read_features_per_fv_async(
         self,
@@ -1018,4 +1278,99 @@ class OnlineStore(ABC):
         pass
 
     async def close(self) -> None:
+        pass
+
+
+def _partition_unregistered_features(
+    registry: BaseRegistry,
+    project: str,
+    feature_refs: List[str],
+) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Split feature refs into resolvable ones and (view, feature) pairs
+    whose feature view is not registered.
+
+    Uses the registry's cached snapshot (``allow_cache=True``) — the same
+    snapshot the subsequent read resolves feature views from — so the
+    classification cannot diverge from the data used for the request.
+    Refs that cannot be parsed are left untouched so existing validation
+    keeps rejecting them exactly as before.
+    """
+    available: List[str] = []
+    unregistered: List[Tuple[str, str]] = []
+    view_registered: Dict[str, bool] = {}
+    for ref in feature_refs:
+        if not isinstance(ref, str):
+            available.append(ref)
+            continue
+        try:
+            view_name, _, feature_name = utils._parse_feature_ref(ref)
+        except Exception:
+            available.append(ref)
+            continue
+        if view_name not in view_registered:
+            try:
+                registry.get_any_feature_view(view_name, project, allow_cache=True)
+                view_registered[view_name] = True
+            except FeastObjectNotFoundException:
+                view_registered[view_name] = False
+        if view_registered[view_name]:
+            available.append(ref)
+        else:
+            unregistered.append((view_name, feature_name))
+    return available, unregistered
+
+
+def _registry_snapshot_token(registry: BaseRegistry) -> Optional[Tuple[int, int]]:
+    """A comparable token for the registry's current cached snapshot.
+
+    Returns None when the registry implementation does not expose a
+    cached proto (version-mismatch detection is then skipped).
+    """
+    proto = getattr(registry, "cached_registry_proto", None)
+    if proto is None:
+        return None
+    last_updated = getattr(proto, "last_updated", None)
+    if last_updated is None:
+        return None
+    return (last_updated.seconds, last_updated.nanos)
+
+
+def _entity_row_count(entity_rows: Mapping[str, Any]) -> int:
+    """Number of entity rows in a columnar entity_rows mapping."""
+    if not entity_rows:
+        return 0
+    first = next(iter(entity_rows.values()))
+    try:
+        return len(first)
+    except TypeError:
+        return 0
+
+
+def _append_null_column(
+    online_features_response: GetOnlineFeaturesResponse,
+    column: str,
+    num_rows: int,
+) -> None:
+    """Append a null-valued feature column (for unregistered views)."""
+    null_value = ValueProto()
+    null_ts = Timestamp()
+    online_features_response.metadata.feature_names.val.append(column)
+    online_features_response.results.append(
+        GetOnlineFeaturesResponse.FeatureVector(
+            values=[null_value] * num_rows,
+            statuses=[FieldStatus.NOT_FOUND] * num_rows,
+            event_timestamps=[null_ts] * num_rows,
+        )
+    )
+
+
+def _track_status_metrics_safely(
+    feature_view_name: str, status_counts: Dict[str, int]
+) -> None:
+    """Emit per-reason status metrics; never let metrics break reads."""
+    try:
+        from feast.metrics import track_online_value_statuses
+
+        track_online_value_statuses(feature_view_name, status_counts)
+    except Exception:
         pass

@@ -41,6 +41,7 @@ class OnlineResponse:
         self,
         online_response_proto: GetOnlineFeaturesResponse,
         feature_types: Optional[Dict[str, ValueType]] = None,
+        status_report: Optional[Any] = None,
     ):
         """
         Construct a native online response from its protobuf version.
@@ -48,9 +49,12 @@ class OnlineResponse:
         Args:
         online_response_proto: GetOnlineResponse proto object to construct from.
         feature_types: Optional mapping of feature names to ValueType for type-aware deserialization.
+        status_report: Optional OnlineStatusReport side-car (present only when
+            online_status tracking is enabled). Never affects to_dict/to_df/to_arrow.
         """
         self.proto = online_response_proto
         self._feature_types = feature_types or {}
+        self.status_report = status_report
         # Delete DUMMY_ENTITY_ID from proto if it exists
         for idx, val in enumerate(self.proto.metadata.feature_names.val):
             if val == DUMMY_ENTITY_ID:

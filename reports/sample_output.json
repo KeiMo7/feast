@@ -1,0 +1,124 @@
+{
+  "sample1_five_scenarios": {
+    "values": {
+      "driver_id": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "lat": [
+        0.5,
+        null,
+        "oops",
+        null
+      ],
+      "lon": [
+        null,
+        "2.0",
+        null,
+        null
+      ],
+      "foo": [
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    "status_report": {
+      "registry_version_mismatch": false,
+      "defaults_filled": false,
+      "failed_batches": [],
+      "feature_views": [
+        {
+          "feature_view": "driver_locations",
+          "version": 0,
+          "event_timestamps": [
+            "2026-11-23T03:48:06+00:00",
+            "2026-11-23T03:48:06+00:00",
+            "2026-11-23T03:48:06+00:00",
+            null
+          ],
+          "features": {
+            "lat": [
+              "present",
+              "null_value",
+              "unsupported_type",
+              "entity_not_found"
+            ],
+            "lon": [
+              "feature_not_materialized",
+              "present",
+              "feature_not_materialized",
+              "entity_not_found"
+            ]
+          }
+        },
+        {
+          "feature_view": "ghost_view",
+          "version": null,
+          "event_timestamps": [
+            null,
+            null,
+            null,
+            null
+          ],
+          "features": {
+            "foo": [
+              "feature_view_not_registered",
+              "feature_view_not_registered",
+              "feature_view_not_registered",
+              "feature_view_not_registered"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "sample2_partial_failure": {
+    "values": {
+      "driver_id": [
+        1,
+        2,
+        3
+      ],
+      "lat": [
+        0.5,
+        null,
+        "oops"
+      ]
+    },
+    "status_report": {
+      "registry_version_mismatch": false,
+      "defaults_filled": false,
+      "failed_batches": [
+        {
+          "feature_view": "driver_locations",
+          "batch_index": 1,
+          "row_count": 1,
+          "attempts": 2,
+          "error_type": "RuntimeError"
+        }
+      ],
+      "feature_views": [
+        {
+          "feature_view": "driver_locations",
+          "version": 0,
+          "event_timestamps": [
+            "2026-11-23T03:48:06+00:00",
+            null,
+            "2026-11-23T03:48:06+00:00"
+          ],
+          "features": {
+            "lat": [
+              "present",
+              "store_unavailable",
+              "unsupported_type"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

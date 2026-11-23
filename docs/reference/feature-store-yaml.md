@@ -81,6 +81,41 @@ When `registry.mcp.enabled` is `true`, the REST registry server exposes registry
 metadata (entities, feature views, feature services) as MCP tool endpoints for
 LLM agents. Requires `feast[mcp]` to be installed.
 
+### online_status
+
+The optional `online_status` block enables per-row, per-feature status tracking
+for `get_online_features`. When enabled, every `OnlineResponse` carries a
+`status_report` side-car explaining *why* each value is present or missing
+(entity not found, feature never materialized, materialized-but-null,
+unsupported type, unregistered feature view, outside TTL, or store
+unavailable). The existing response structure (`to_dict()` / `to_df()` /
+`to_arrow()`) is unchanged; when the block is absent or `enabled: false`,
+behavior is byte-for-byte identical to before.
+
+```yaml
+online_status:
+  enabled: true           # Attach a status report to every online response
+  fill_defaults: false    # Explicitly opt in to filling missing values with defaults
+  defaults:               # Optional per-feature fill overrides
+    avg_orders_day: 0.0
+  read_batch_size: 500    # Split each feature view's read into batches of this size
+  max_batch_retries: 2    # Retries per failed batch before marking it store_unavailable
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Attach an `OnlineStatusReport` to every online response |
+| `fill_defaults` | bool | `false` | Replace fillable missing values with defaults in the returned values. The original status is always preserved in the report |
+| `defaults` | map | `{}` | Per-feature default overrides keyed by result column name; features without an override get a type-appropriate zero value |
+| `read_batch_size` | int | unset | Split large reads into batches so one failing batch does not fail the whole request. Unset keeps today's single-read behavior |
+| `max_batch_retries` | int | `2` | Retry cap per failed read batch; exceeded batches are listed in the report's `failed_batches` |
+
+Missing-reason counts are exported through the existing
+`feast_online_features_status_total{feature_view, status}` Prometheus counter
+with fine-grained `status` labels (`entity_not_found`,
+`feature_not_materialized`, `null_value`, `unsupported_type`,
+`feature_view_not_registered`, `store_unavailable`, ...).
+
 ## Providers
 
 The `provider` field defines the environment in which Feast will execute data flows. As a result, it also determines the default values for other fields.

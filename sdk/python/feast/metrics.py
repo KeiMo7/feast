@@ -56,7 +56,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Callable, Iterable, List, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, List, Mapping, Optional
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import psutil
@@ -443,6 +443,26 @@ def track_feature_statuses(
         online_features_status_total.labels(
             feature_view=feature_view_name, status="outside_max_age"
         ).inc(outside_max_age_count)
+
+
+def track_online_value_statuses(
+    feature_view_name: str, status_counts: Mapping[str, int]
+):
+    """Record per-reason online value status counts for a feature view.
+
+    Uses the existing ``feast_online_features_status_total`` counter so
+    missing reasons can be aggregated by the ``status`` label (e.g.
+    ``entity_not_found``, ``feature_not_materialized``, ``null_value``,
+    ``unsupported_type``, ``feature_view_not_registered``,
+    ``store_unavailable``).
+    """
+    if not _config.online_features:
+        return
+    for status, count in status_counts.items():
+        if count > 0:
+            online_features_status_total.labels(
+                feature_view=feature_view_name, status=status
+            ).inc(count)
 
 
 def track_transformation(odfv_name: str, mode: str, duration_seconds: float):
