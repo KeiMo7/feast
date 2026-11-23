@@ -219,7 +219,30 @@ class RetrievalJob(ABC):
         if self.on_demand_feature_views:
             odfv_feature_refs = self._get_odfv_feature_refs()
 
-            for odfv in self.on_demand_feature_views:
+            # Evaluate in dependency order so a view that consumes another
+            # view's output sees it.  For independent views the order is the
+            # incoming order, leaving single-layer retrieval unchanged.
+            from feast.derived_feature import (
+                order_feature_views_by_dependencies,
+                required_upstream_outputs,
+            )
+
+            ordered_odfvs = order_feature_views_by_dependencies(
+                self.on_demand_feature_views
+            )
+
+            # Outputs of one view that another view consumes as input.  They are
+            # computed so the downstream layer can run, then removed before the
+            # result is returned unless the caller asked for them.  Only outputs
+            # of *other* on-demand views count; a raw feature view's columns came
+            # from the query and must be preserved exactly as before.
+            intermediate_columns: set = set()
+            for view_name, features in required_upstream_outputs(ordered_odfvs).items():
+                for feature in features:
+                    intermediate_columns.add(feature)
+                    intermediate_columns.add(f"{view_name}__{feature}")
+
+            for odfv in ordered_odfvs:
                 transformed_arrow = odfv.transform_arrow(
                     features_table, self.full_feature_names
                 )
@@ -236,14 +259,27 @@ class RetrievalJob(ABC):
                 for col in transformed_arrow.column_names:
                     if col.startswith("__index"):
                         continue
-                    # Only append the column if it was requested, or if we don't have feature metadata
+                    # Only append the column if it was requested, or if we don't
+                    # have feature metadata, or if a downstream view needs it.
                     if (
                         requested_features_for_odfv is None
                         or col in requested_features_for_odfv
+                        or col in intermediate_columns
                     ):
                         features_table = features_table.append_column(
                             col, transformed_arrow[col]
                         )
+
+            # Drop intermediate columns the caller did not request.
+            if odfv_feature_refs:
+                requested_odfv_columns: set = set()
+                for cols in odfv_feature_refs.values():
+                    requested_odfv_columns |= cols
+                for col in list(intermediate_columns):
+                    if col in features_table.column_names and (
+                        col not in requested_odfv_columns
+                    ):
+                        features_table = features_table.drop_columns(col)
 
         if validation_reference:
             if not flags_helper.is_test():

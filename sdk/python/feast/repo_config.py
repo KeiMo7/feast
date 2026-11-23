@@ -316,6 +316,17 @@ class DataQualityMonitoringConfig(FeastConfigBaseModel):
     """Whether baseline distribution is computed automatically on ``feast apply``."""
 
 
+class DerivedFeaturesConfig(FeastConfigBaseModel):
+    """Configuration for multi-layer derived feature chains."""
+
+    enabled: StrictBool = True
+    """Whether multi-layer derived feature chains are permitted.
+
+    When false, an on-demand feature view may not declare another on-demand
+    feature view as a source, and chain registration is rejected. Single-layer
+    on-demand feature views are unaffected. Defaults to True. """
+
+
 class OpenLineageConsumerConfig(FeastBaseModel):
     """Configuration for the OpenLineage consumer (event receiver)."""
 
@@ -540,6 +551,15 @@ class RepoConfig(FeastBaseModel):
         None, alias="data_quality_monitoring"
     )
     """ DataQualityMonitoringConfig: Data Quality Monitoring configuration (optional). """
+
+    derived_features_config: "DerivedFeaturesConfig" = Field(
+        default_factory=lambda: DerivedFeaturesConfig(), alias="derived_features"
+    )
+    """ DerivedFeaturesConfig: Multi-layer derived feature chain settings (optional).
+
+    Defaults to enabled. Set ``derived_features: {enabled: false}`` to turn the
+    capability off, in which case single-layer on-demand features behave exactly
+    as before and multi-layer chains are rejected at registration. """
 
     def __init__(self, **data: Any):
         super().__init__(**data)

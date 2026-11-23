@@ -7,7 +7,7 @@ import socket
 import threading
 import typing
 import warnings
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
@@ -242,7 +242,41 @@ def _get_requested_on_demand_feature_views(
         seen.add(key)
         resolved.append(odfv)
 
+    # Include on-demand views that the resolved views transitively depend on, in
+    # dependency order, so a multi-layer chain evaluates bottom-up.  Views that no
+    # other resolved view depends on are appended in their original order, which
+    # leaves single-layer retrieval unchanged.
+    if any(_odfv_has_on_demand_sources(odfv, promoted_by_name) for odfv in resolved):
+        from feast.derived_feature import transitive_on_demand_dependencies
+
+        by_name = {
+            **promoted_by_name,
+            **{odfv.name: odfv for odfv in resolved},
+        }
+        ordered: "OrderedDict[str, OnDemandFeatureView]" = OrderedDict()
+        stack = list(resolved)
+        while stack:
+            current = stack.pop(0)
+            if current.name in ordered:
+                continue
+            ordered[current.name] = current
+            for projection in current.source_feature_view_projections.values():
+                upstream = by_name.get(projection.name)
+                if upstream is not None:
+                    stack.append(upstream)
+        resolved = transitive_on_demand_dependencies(list(ordered.values()))
+
     return resolved
+
+
+def _odfv_has_on_demand_sources(
+    odfv: "OnDemandFeatureView", odfv_by_name: Dict[str, "OnDemandFeatureView"]
+) -> bool:
+    """True if any declared source of ``odfv`` is itself an ODFV."""
+    from feast.derived_feature import _safe_projections
+
+    projections = _safe_projections(odfv)
+    return any(projection.name in odfv_by_name for projection in projections.values())
 
 
 def get_user_agent():
@@ -754,6 +788,130 @@ def _validate_feature_refs(feature_refs: List[str], full_feature_names: bool = F
         raise FeatureNameCollisionError(collided_feature_refs, full_feature_names)
 
 
+def _order_odfvs_for_online(
+    requested_on_demand_feature_views: List["OnDemandFeatureView"],
+    requested_odfv_map: Dict[str, "OnDemandFeatureView"],
+    odfv_feature_refs: Mapping[str, Any],
+) -> List[str]:
+    """Return every view that must be evaluated, in dependency order.
+
+    This includes views that were pulled in solely as an upstream of a requested
+    view (e.g. an intermediate layer of a derived feature chain).  Their outputs
+    are computed so downstream layers can read them, then dropped from the
+    response unless the caller asked for them.
+
+    The order comes from the declared ``sources`` alone.  Independent views keep
+    their incoming order, so a single-layer request is unaffected.
+    """
+    order: List[str] = list(odfv_feature_refs.keys())
+    # Append upstream views that were added during request preparation but are
+    # not themselves named in the feature refs.
+    seen = set(order)
+    for key, view in requested_odfv_map.items():
+        if key not in seen:
+            order.append(key)
+            seen.add(key)
+    if len(order) <= 1:
+        return order
+
+    # Map each requested view to the requested views it depends on.  Sources are
+    # named by the upstream view's real name, which may differ from the key used
+    # in the requested map when the caller aliased it, so resolve through a
+    # reverse lookup.
+    name_to_key: Dict[str, str] = {}
+    for key, view in requested_odfv_map.items():
+        name_to_key.setdefault(view.name, key)
+
+    dependencies: Dict[str, Set[str]] = defaultdict(set)
+    for key in order:
+        view = requested_odfv_map[key]
+        from feast.derived_feature import _safe_projections
+
+        projections = _safe_projections(view)
+        for projection in projections.values():
+            upstream_key = name_to_key.get(projection.name)
+            if upstream_key is not None and upstream_key != key:
+                dependencies[key].add(upstream_key)
+
+    if not any(dependencies.values()):
+        return order
+
+    ordered: List[str] = []
+    visiting: Set[str] = set()
+    visited: Set[str] = set()
+
+    def visit(key: str) -> None:
+        if key in visited:
+            return
+        if key in visiting:
+            from feast.errors import DerivedFeatureCycleError
+
+            raise DerivedFeatureCycleError(
+                f"On-demand feature views requested for online retrieval form a "
+                f"cycle at '{key}'."
+            )
+        visiting.add(key)
+        for dependency in sorted(dependencies.get(key, ())):
+            visit(dependency)
+        visiting.discard(key)
+        visited.add(key)
+        ordered.append(key)
+
+    for key in order:
+        visit(key)
+    return ordered
+
+
+def _looks_like_on_demand_source(projection: Any) -> bool:
+    """Whether a projection was recorded as pointing at another ODFV."""
+    try:
+        from feast.on_demand_feature_view import OnDemandFeatureView
+
+        return (
+            getattr(projection, "view_type", "") == OnDemandFeatureView._ODFV_VIEW_TYPE
+        )
+    except Exception:
+        return False
+
+
+def _collect_on_demand_dependencies(
+    view_name: str,
+    on_demand_view_index: Dict[str, "OnDemandFeatureView"],
+    on_demand_view_features: Dict[str, Set[str]],
+    views_features: Optional[Dict[str, Set[str]]] = None,
+    view_index: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Record an upstream ODFV's outputs and recurse into its own sources.
+
+    Mirrors the dependency walk used at resolution time so that an upstream
+    view in a multi-layer chain is scheduled and given every feature its
+    downstream consumers need.  Raw feature views consumed anywhere along the
+    chain are added to ``views_features`` so the offline store fetches them.
+    """
+    try:
+        upstream_odfv = on_demand_view_index[view_name]
+    except KeyError:
+        return
+    required = set(on_demand_view_features.get(view_name, set()))
+    # Downstream layers consume this view's declared outputs; make sure all of
+    # them are materialised unless the caller narrowed the request.
+    for feature in upstream_odfv.features:
+        required.add(feature.name)
+    on_demand_view_features[view_name] = required
+    for projection in upstream_odfv.source_feature_view_projections.values():
+        if projection.name in on_demand_view_index:
+            _collect_on_demand_dependencies(
+                projection.name,
+                on_demand_view_index,
+                on_demand_view_features,
+                views_features,
+                view_index,
+            )
+        elif views_features is not None:
+            for feature in projection.features:
+                views_features[projection.name].add(feature.name)
+
+
 def _group_feature_refs(
     features: List[str],
     all_feature_views: List["FeatureView"],
@@ -812,10 +970,43 @@ def _group_feature_refs(
             for input_fv_projection in on_demand_view_index[
                 view_name
             ].source_feature_view_projections.values():
+                # A source may itself be an on-demand view (a derived feature
+                # chain). Those features are produced by that view's own
+                # transformation, so record them against the ODFV and recurse
+                # rather than expecting them from a physical feature view.  The
+                # recursion also records the raw feature views further up the
+                # chain so the offline store fetches their columns.
+                if input_fv_projection.name in on_demand_view_index or (
+                    input_fv_projection.name not in view_index
+                    and _looks_like_on_demand_source(input_fv_projection)
+                ):
+                    _collect_on_demand_dependencies(
+                        input_fv_projection.name,
+                        on_demand_view_index,
+                        on_demand_view_features,
+                        views_features,
+                        view_index,
+                    )
+                    continue
+                if input_fv_projection.name not in view_index:
+                    raise FeatureViewNotFoundException(input_fv_projection.name)
                 for input_feat in input_fv_projection.features:
                     views_features[input_fv_projection.name].add(input_feat.name)
         else:
             raise FeatureViewNotFoundException(view_name)
+
+    # Upstream views pulled in only as sources are indexed under their real name.
+    # Ensure the feature views that feed any requested view are present too, even
+    # when the caller never named them.
+    for view_name in list(on_demand_view_index.keys()):
+        if view_name in on_demand_view_features:
+            _collect_on_demand_dependencies(
+                view_name,
+                on_demand_view_index,
+                on_demand_view_features,
+                views_features,
+                view_index,
+            )
 
     fvs_result: List[Tuple[Union["FeatureView", "OnDemandFeatureView"], List[str]]] = []
     odfvs_result: List[Tuple["OnDemandFeatureView", List[str]]] = []
@@ -924,6 +1115,27 @@ def _augment_response_with_on_demand_transforms(
                 else feature_name
             )
 
+    # Order the transforms by their declared dependencies.  A view that consumes
+    # another view's output must run after it; declaration/request order plays no
+    # part.  Views with no such relationship keep their existing order, so the
+    # single-layer path is byte-for-byte unchanged.
+    odfv_eval_order = _order_odfvs_for_online(
+        requested_on_demand_feature_views, requested_odfv_map, odfv_feature_refs
+    )
+
+    # Outputs of one view that another requested view consumes as input.  These
+    # are materialised even when the caller did not ask for them, then dropped
+    # from the response before it is returned.  Read off the declared sources via
+    # the shared helper so there is one definition of "intermediate output".
+    from feast.derived_feature import required_upstream_outputs
+
+    _upstream_outputs = required_upstream_outputs(requested_on_demand_feature_views)
+    _downstream_required: Set[str] = set()
+    for view_name, features in _upstream_outputs.items():
+        for feature in features:
+            _downstream_required.add(feature)
+            _downstream_required.add(f"{view_name}__{feature}")
+
     initial_response = OnlineResponse(
         online_features_response, feature_types=feature_types
     )
@@ -942,7 +1154,8 @@ def _augment_response_with_on_demand_transforms(
 
     # Apply on demand transformations and augment the result rows
     odfv_result_names = set()
-    for odfv_name, _feature_refs in odfv_feature_refs.items():
+    for odfv_name in odfv_eval_order:
+        _feature_refs = odfv_feature_refs.get(odfv_name, [])
         odfv = requested_odfv_map[odfv_name]
         if not odfv.write_to_online_store:
             _should_track = _metrics_active and getattr(odfv, "track_metrics", False)
@@ -999,9 +1212,24 @@ def _augment_response_with_on_demand_transforms(
                 for projection in other_odfv.source_feature_view_projections.values():
                     if projection.name in declared_source_names:
                         continue
-                    for feature in projection.features:
-                        undeclared_columns.add(feature.name)
-                        undeclared_columns.add(f"{projection.name}__{feature.name}")
+                    # An upstream on-demand view's declared outputs are legitimate
+                    # inputs for this layer when this view consumes them, so keep
+                    # them out of ``undeclared_columns`` whenever this view's
+                    # own sources name that upstream view.
+                    for other_feature in projection.features:
+                        undeclared_columns.add(other_feature.name)
+                        undeclared_columns.add(
+                            f"{projection.name}__{other_feature.name}"
+                        )
+            # ...except the outputs of an upstream ODFV this layer actually
+            # declares as a source.
+            for projection in odfv.source_feature_view_projections.values():
+                if projection.name in requested_odfv_map:
+                    for used_feature in projection.features:
+                        undeclared_columns.discard(used_feature.name)
+                        undeclared_columns.discard(
+                            f"{projection.name}__{used_feature.name}"
+                        )
 
             if odfv.mode == "python":
                 if initial_response_dict is None:
@@ -1051,7 +1279,19 @@ def _augment_response_with_on_demand_transforms(
                 if isinstance(transformed_features, pyarrow.Table)
                 else transformed_features
             )
+            # Include both the caller-requested outputs and any outputs that a
+            # downstream on-demand view declared as its input.  The latter are
+            # intermediate chain products: they are needed to evaluate the next
+            # layer, then dropped by ``_drop_unneeded_columns``.
             selected_subset = [f for f in transformed_columns if f in _feature_refs]
+            # Also carry intermediate outputs that a downstream on-demand view
+            # declared as its input column, on top of the requested ones.
+            for candidate in transformed_columns:
+                if (
+                    candidate in _downstream_required
+                    and candidate not in selected_subset
+                ):
+                    selected_subset.append(candidate)
 
             proto_values = []
             schema_dict = {k.name: k.dtype for k in odfv.schema}
@@ -1091,6 +1331,14 @@ def _augment_response_with_on_demand_transforms(
                         event_timestamps=[Timestamp()] * len(proto_values[feature_idx]),
                     )
                 )
+
+            # A downstream layer reads this layer's outputs from the response, so
+            # the lazily-built views must reflect the columns just appended.
+            if selected_subset:
+                if initial_response_arrow is not None:
+                    initial_response_arrow = None
+                if initial_response_dict is not None:
+                    initial_response_dict = None
 
 
 def _get_entity_maps(
@@ -1451,7 +1699,8 @@ def _get_feature_views_to_use(
                 parsed.append((fv_name, version_num, None))
         feature_views = parsed  # type: ignore[assignment]
 
-    fvs_to_use, od_fvs_to_use = [], []
+    fvs_to_use: List["FeatureView"] = []
+    od_fvs_to_use: List["OnDemandFeatureView"] = []
     fvs_by_projection_key: Dict[str, "FeatureView"] = {}
 
     def _append_or_merge_source_fv(fv_with_projection: "FeatureView") -> None:
@@ -1469,6 +1718,34 @@ def _get_feature_views_to_use(
         else:
             _merge_projection_features(
                 existing.projection, fv_with_projection.projection
+            )
+
+    def _resolve_on_demand_view(
+        source_fv: "OnDemandFeatureView", source_projection: Any
+    ) -> None:
+        """Queue an upstream ODFV before the view that depends on it."""
+        if any(existing.name == source_fv.name for existing in od_fvs_to_use):
+            return
+        # Register with the projection the downstream view declared so that both
+        # sides agree on which upstream features are required.
+        projected = source_fv.with_projection(copy.copy(source_projection))
+        od_fvs_to_use.append(projected)
+        for upstream_projection in projected.source_feature_view_projections.values():
+            upstream_fv = registry.get_any_feature_view(
+                upstream_projection.name, project, allow_cache
+            )
+            if isinstance(upstream_fv, OnDemandFeatureView):
+                _resolve_on_demand_view(upstream_fv, upstream_projection)
+                continue
+            if (
+                hide_dummy_entity
+                and upstream_fv.entities  # type: ignore[attr-defined]
+                and upstream_fv.entities[0] == DUMMY_ENTITY_NAME  # type: ignore[attr-defined]
+            ):
+                upstream_fv.entities = []  # type: ignore[attr-defined]
+                upstream_fv.entity_columns = []  # type: ignore[attr-defined]
+            _append_or_merge_source_fv(
+                upstream_fv.with_projection(copy.copy(upstream_projection))
             )
 
     for name, version_num, projection in feature_views:
@@ -1536,6 +1813,15 @@ def _get_feature_views_to_use(
                 source_fv = registry.get_any_feature_view(
                     source_projection.name, project, allow_cache
                 )
+                # A source may itself be a derived (on-demand) view. It must be
+                # queued as an on-demand view so it is computed before this one,
+                # and so its own sources are expanded in turn. Its raw upstreams
+                # are resolved through the recursive call below, not treated as
+                # physical feature views.
+                if isinstance(source_fv, OnDemandFeatureView):
+                    _resolve_on_demand_view(source_fv, source_projection)
+                    continue
+
                 # TODO better way to handler dummy entities
                 if (
                     hide_dummy_entity

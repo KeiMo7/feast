@@ -78,6 +78,7 @@
   * [Scaling Feast](how-to-guides/scaling-feast.md)
   * [Structuring Feature Repos](how-to-guides/structuring-repos.md)
   * [Multi-Team Feature Store Setup](how-to-guides/federated-feature-store.md)
+  * [Multi-layer derived features](how-to-guides/derived-feature-chains.md)
 * [Running Feast in production (e.g. on Kubernetes)](how-to-guides/running-feast-in-production.md)
 * [Feast on Kubernetes](how-to-guides/feast-on-kubernetes.md)
   * [Operator Configuration Guides](how-to-guides/feast-operator/README.md)

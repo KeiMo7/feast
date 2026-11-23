@@ -39,7 +39,9 @@ from feast.value_type import ValueType
 from feast.version_utils import normalize_version_string
 
 warnings.simplefilter("once", DeprecationWarning)
-OnDemandSourceType = Union[FeatureView, FeatureViewProjection, RequestSource]
+OnDemandSourceType = Union[
+    FeatureView, FeatureViewProjection, RequestSource, "OnDemandFeatureView"
+]
 
 
 class ODFVErrorMessages:
@@ -137,6 +139,7 @@ class OnDemandFeatureView(BaseFeatureView):
 
     _TRACK_METRICS_TAG = "feast:track_metrics"
     _INPUT_SCHEMA_SOURCE_PREFIX = "__input_schema__"
+    _ODFV_VIEW_TYPE = "onDemandFeatureView"
 
     name: str
     entities: Optional[List[str]]
@@ -357,11 +360,22 @@ class OnDemandFeatureView(BaseFeatureView):
             self.source_feature_view_projections[odfv_source.name] = (
                 odfv_source.projection
             )
+        elif isinstance(odfv_source, OnDemandFeatureView):
+            # A derived feature may be built on top of another derived feature.
+            # The upstream view's declared projection (name + features) is what
+            # downstream evaluation needs, so record it as a normal projection.
+            # Chain metadata is stored in tags, not here, so there is still a
+            # single copy of the dependency graph.  ``view_type`` distinguishes an
+            # ODFV upstream from a raw FeatureView one at retrieval time.
+            upstream_projection = copy.copy(odfv_source.projection)
+            upstream_projection.view_type = self._ODFV_VIEW_TYPE
+            self.source_feature_view_projections[odfv_source.name] = upstream_projection
         else:
             raise ValueError(
                 ODFVErrorMessages.unsupported_source_type(
                     type(odfv_source),
-                    "RequestSource, FeatureViewProjection, and FeatureView",
+                    "RequestSource, FeatureViewProjection, FeatureView, and "
+                    "OnDemandFeatureView",
                 )
             )
 

@@ -55,3 +55,15 @@ def on_demand_feature_view_list(ctx: click.Context, tags: list[str]):
     from tabulate import tabulate
 
     print(tabulate(table, headers=["NAME"], tablefmt="plain"))
+
+
+@on_demand_feature_views_cmd.command(name="dependencies")
+@click.pass_context
+def on_demand_feature_view_dependencies(ctx: click.Context):
+    """
+    [Experimental] Print the derived feature dependency graph for review.
+
+    Only view and feature names are printed; no feature values are included.
+    """
+    store = create_feature_store(ctx)
+    print(store.export_derived_feature_dependencies())

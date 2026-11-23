@@ -14,10 +14,12 @@
 import asyncio
 import copy
 import itertools
+import json
 import logging
 import os
 import time
 import warnings
+from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -65,6 +67,7 @@ from feast.errors import (
     ConflictingFeatureViewNames,
     DataFrameSerializationError,
     DataSourceRepeatNamesException,
+    DerivedFeatureChainError,
     FeatureViewNotFoundException,
     PushSourceNotFoundException,
     RequestDataNotFoundInEntityDfException,
@@ -1094,8 +1097,182 @@ class FeatureStore:
 
         Raises:
             FeatureViewNotFoundException: The feature view could not be found.
+            FeatureViewInUseError: Another registered view still declares this
+                view as an upstream source.
         """
+        dependents = self.get_feature_view_dependents(name)
+        if dependents:
+            from feast.errors import FeatureViewInUseError
+
+            raise FeatureViewInUseError(name, dependents)
         return self.registry.delete_feature_view(name, self.project)
+
+    def get_feature_view_dependencies(self, name: str) -> List[str]:
+        """Return the upstream view names ``name`` declares as sources."""
+        return self._declared_upstreams(
+            self.registry.get_any_feature_view(name, self.project)
+        )
+
+    def get_feature_view_dependents(self, name: str) -> List[str]:
+        """Return registered views that declare ``name`` as an upstream source.
+
+        Used to refuse deletion of a view that a downstream view still consumes.
+        """
+        dependents: List[str] = []
+        for view in self.registry.list_all_feature_views(self.project):
+            if view.name == name:
+                continue
+            if name in self._declared_upstreams(view):
+                dependents.append(view.name)
+        return sorted(dependents)
+
+    @staticmethod
+    def _declared_upstreams(view: Any) -> List[str]:
+        projections = getattr(view, "source_feature_view_projections", None)
+        if not projections:
+            return []
+        return list(
+            OrderedDict.fromkeys(projection.name for projection in projections.values())
+        )
+
+    def _guard_feature_view_deletions(self, views_to_delete: List[Any]) -> None:
+        """Reject deletion of views still referenced by surviving views.
+
+        ``views_to_delete`` are removed together, so references *between* them are
+        allowed; only references from views that will remain are blocking.
+        """
+        from feast.errors import FeatureViewInUseError
+
+        deleting = {view.name for view in views_to_delete if view is not None}
+        if not deleting:
+            return
+        try:
+            survivors = [
+                view
+                for view in self.registry.list_all_feature_views(self.project)
+                if view.name not in deleting
+            ]
+        except Exception:
+            return
+        blocked: Dict[str, List[str]] = {}
+        for survivor in survivors:
+            for upstream in self._declared_upstreams(survivor):
+                if upstream in deleting:
+                    blocked.setdefault(upstream, []).append(survivor.name)
+        if blocked:
+            first = sorted(blocked)[0]
+            raise FeatureViewInUseError(first, blocked[first])
+
+    def export_derived_feature_dependencies(self) -> str:
+        """Export the on-demand dependency graph as human-readable text.
+
+        Only views and features are printed; no feature values appear.  The graph
+        is reconstructed from each view's declared sources, so it is the same
+        declaration used for evaluation.
+        """
+        odfvs = self.registry.list_on_demand_feature_views(self.project)
+        if not odfvs:
+            return "derived feature dependencies: (none)\n"
+        by_name = {view.name: view for view in odfvs}
+
+        from feast.derived_feature import order_feature_views_by_dependencies
+
+        ordered = order_feature_views_by_dependencies(odfvs)
+        lines = ["derived feature dependencies:"]
+        for index, view in enumerate(ordered, start=1):
+            outputs = ", ".join(field.name for field in view.features)
+            inputs = ", ".join(
+                str(ref)
+                for projection in view.source_feature_view_projections.values()
+                for ref in [
+                    f"{projection.name}:{feature.name}"
+                    for feature in projection.features
+                ]
+            )
+            marker = (
+                " [on-demand source]"
+                if (
+                    view.name in by_name
+                    and any(
+                        projection.name in by_name
+                        for projection in view.source_feature_view_projections.values()
+                    )
+                )
+                else ""
+            )
+            lines.append(
+                f"  {index}. {view.name}{marker} outputs=[{outputs}] inputs=[{inputs}]"
+            )
+        return "\n".join(lines) + "\n"
+
+    def apply_derived_feature_chain(
+        self,
+        chain: Any,
+        *,
+        type_resolver: Optional[Any] = None,
+        entity_resolver: Optional[Any] = None,
+    ) -> List[str]:
+        """Register a :class:`feast.derived_feature.DerivedFeatureChain`.
+
+        The chain is validated once (the same validation used at evaluation), then
+        each layer is registered as a linked ``OnDemandFeatureView``.  Returns the
+        registered view names in evaluation order.
+        """
+        from feast.derived_feature import DerivedFeatureChain
+
+        if not isinstance(chain, DerivedFeatureChain):
+            raise ValueError(
+                "apply_derived_feature_chain expects a DerivedFeatureChain."
+            )
+        if not getattr(
+            getattr(self.config, "derived_features_config", None), "enabled", True
+        ):
+            from feast.errors import DerivedFeatureChainError
+
+            raise DerivedFeatureChainError(
+                "Multi-layer derived feature chains are disabled. Set "
+                "derived_features.enabled: true in feature_store.yaml to use them."
+            )
+
+        available_types: Dict[str, Dict[str, Any]] = {}
+        known_views: List[str] = []
+        for view in self.registry.list_all_feature_views(self.project):
+            known_views.append(view.name)
+            if isinstance(view, OnDemandFeatureView):
+                available_types[view.name] = {
+                    field.name: field.dtype for field in view.features
+                }
+            else:
+                available_types[view.name] = {
+                    field.name: field.dtype for field in getattr(view, "features", [])
+                }
+
+        chain.validate(available_types=available_types, known_views=known_views)
+
+        if type_resolver is None:
+
+            def type_resolver(view_name: str, feature_name: str):
+                fields = available_types.get(view_name, {})
+                if feature_name in fields:
+                    from feast.field import Field as _Field
+
+                    return _Field(name=feature_name, dtype=fields[feature_name])
+                return None
+
+        if entity_resolver is None:
+
+            def entity_resolver(entity_name: str):
+                try:
+                    return self.registry.get_entity(entity_name, self.project)
+                except Exception:
+                    return None
+
+        views = chain.to_feature_views(
+            type_resolver=type_resolver, entity_resolver=entity_resolver
+        )
+        self.apply(views)
+        by_name = {view.name: view for view in views}
+        return [name for name in chain.topological_order() if name in by_name]
 
     def enable_feature_view(self, name: str):
         """
@@ -1175,6 +1352,214 @@ class FeatureStore:
                 *sfvs_to_update,
                 *(lvs_to_update or []),
             ]
+        )
+        self._validate_derived_feature_chains(
+            views_to_update=views_to_update,
+            odfvs_to_update=odfvs_to_update,
+            sfvs_to_update=sfvs_to_update,
+        )
+
+    def _validate_derived_feature_chains(
+        self,
+        views_to_update: List[FeatureView],
+        odfvs_to_update: List[OnDemandFeatureView],
+        sfvs_to_update: List[StreamFeatureView],
+    ) -> None:
+        """Validate multi-layer derived feature chains at registration time.
+
+        Uses the same ``DerivedFeatureChain`` object runtime evaluation uses, so
+        a chain cannot pass registration and then fail (or disagree) at serving.
+        This checks cycles, missing upstreams, and type compatibility, including
+        for chains assembled from already-registered views.
+        """
+        if not odfvs_to_update:
+            return
+
+        if not getattr(
+            getattr(self.config, "derived_features_config", None), "enabled", True
+        ):
+            # Capability disabled: reject any multi-layer declaration so behavior
+            # stays exactly as it was before this feature existed.
+            multi_layer = [
+                view.name
+                for view in odfvs_to_update
+                if self._declares_any_on_demand_source_in(view, odfvs_to_update)
+            ]
+            if multi_layer:
+                from feast.errors import DerivedFeatureChainError
+
+                raise DerivedFeatureChainError(
+                    "Multi-layer derived feature chains are disabled. Set "
+                    "derived_features.enabled: true in feature_store.yaml to use "
+                    f"them. Offending views: {sorted(multi_layer)}."
+                )
+            return
+
+        # Build the set of views that will exist after this apply. Existing
+        # views are included so that re-applying a single layer of a previously
+        # registered chain still sees its siblings.
+        all_views: Dict[str, BaseFeatureView] = {}
+        try:
+            for existing in self.registry.list_all_feature_views(self.project):
+                all_views[existing.name] = existing
+        except Exception:
+            # A missing/empty registry is fine: only the incoming set matters.
+            pass
+        for view in [
+            *views_to_update,
+            *odfvs_to_update,
+            *sfvs_to_update,
+        ]:
+            all_views[view.name] = view
+
+        odfv_by_name: Dict[str, OnDemandFeatureView] = {
+            name: view
+            for name, view in all_views.items()
+            if isinstance(view, OnDemandFeatureView)
+        }
+
+        # Only chains that are actually multi-layer need chain-level validation;
+        # every other ODFV keeps its existing validation path untouched.
+        chain_members = {
+            name: view
+            for name, view in odfv_by_name.items()
+            if self._odfv_declares_on_demand_source(view, odfv_by_name)
+        }
+        if not chain_members:
+            return
+
+        # Detect cycles across the whole set of on-demand views, not just one
+        # chain, and report every layer involved.
+        from feast.derived_feature import order_feature_views_by_dependencies
+
+        all_odfvs = list(odfv_by_name.values())
+        order_feature_views_by_dependencies(all_odfvs)
+
+        available_types = {
+            name: {field.name: field.dtype for field in getattr(view, "features", [])}
+            for name, view in all_views.items()
+            if not isinstance(view, OnDemandFeatureView)
+        }
+        for name, view in odfv_by_name.items():
+            available_types[name] = {
+                field.name: field.dtype for field in getattr(view, "features", [])
+            }
+
+        visited_chains: set = set()
+        for name, view in sorted(chain_members.items()):
+            chain_name = view.tags.get("feast:derived_chain")
+            if chain_name is None:
+                # Not a declared chain, just ODFV-on-ODFV. Validate the
+                # dependency subgraph structurally.
+                chain_name = f"__odfv_chain__{name}"
+            if chain_name in visited_chains:
+                continue
+            visited_chains.add(chain_name)
+
+            layers = []
+            for layer_name in self._collect_chain_layers(name, odfv_by_name):
+                layer_view = odfv_by_name[layer_name]
+                layers.append(self._odfv_to_derivation_layer(layer_view))
+            from feast.derived_feature import DerivedFeatureChain
+
+            chain = DerivedFeatureChain(name=chain_name, layers=layers)
+            chain.validate(
+                available_types=available_types,
+                known_views=set(all_views),
+            )
+
+    @staticmethod
+    def _declares_any_on_demand_source_in(
+        view: OnDemandFeatureView, odfvs: List[OnDemandFeatureView]
+    ) -> bool:
+        names = {other.name for other in odfvs}
+        return any(
+            projection.name in names
+            for projection in view.source_feature_view_projections.values()
+        )
+
+    def _odfv_declares_on_demand_source(
+        self,
+        view: OnDemandFeatureView,
+        odfv_by_name: Dict[str, OnDemandFeatureView],
+    ) -> bool:
+        return any(
+            projection.name in odfv_by_name
+            for projection in view.source_feature_view_projections.values()
+        )
+
+    def _collect_chain_layers(
+        self,
+        root_name: str,
+        odfv_by_name: Dict[str, OnDemandFeatureView],
+    ) -> List[str]:
+        """Root's transitively connected on-demand views, dependency-ordered."""
+        from feast.derived_feature import order_feature_views_by_dependencies
+
+        connected: "OrderedDict[str, OnDemandFeatureView]" = OrderedDict()
+        stack = [odfv_by_name[root_name]]
+        while stack:
+            current = stack.pop()
+            if current.name in connected:
+                continue
+            connected[current.name] = current
+            for projection in current.source_feature_view_projections.values():
+                upstream = odfv_by_name.get(projection.name)
+                if upstream is not None:
+                    stack.append(upstream)
+        # Also include views that depend on root (so the whole graph validates).
+        changed = True
+        while changed:
+            changed = False
+            for name, view in odfv_by_name.items():
+                if name in connected:
+                    continue
+                if any(
+                    projection.name in connected
+                    for projection in view.source_feature_view_projections.values()
+                ):
+                    connected[name] = view
+                    changed = True
+        ordered = order_feature_views_by_dependencies(list(connected.values()))
+        return [view.name for view in ordered]
+
+    def _odfv_to_derivation_layer(self, view: OnDemandFeatureView):
+        """Rebuild a ``DerivationLayer`` from a registered ODFV's declaration."""
+        from feast.derived_feature import (
+            DERIVED_DEFAULTS_TAG,
+            DERIVED_MISSING_POLICY_TAG,
+            DerivationLayer,
+            MissingUpstreamPolicy,
+        )
+
+        inputs = []
+        for projection in view.source_feature_view_projections.values():
+            for feature in projection.features:
+                inputs.append(f"{projection.name}:{feature.name}")
+
+        defaults: Dict[str, Any] = {}
+        if view.tags.get(DERIVED_DEFAULTS_TAG):
+            try:
+                defaults = json.loads(view.tags[DERIVED_DEFAULTS_TAG])
+            except (TypeError, ValueError):
+                defaults = {}
+        policy = view.tags.get(
+            DERIVED_MISSING_POLICY_TAG, MissingUpstreamPolicy.UNAVAILABLE.value
+        )
+        if view.feature_transformation is None:
+            raise DerivedFeatureChainError(
+                f"Cannot validate chain: on-demand feature view '{view.name}' has "
+                "no transformation."
+            )
+        return DerivationLayer(
+            name=view.name,
+            inputs=inputs,
+            features=list(view.features),
+            transformation=view.feature_transformation,
+            mode=view.mode,
+            missing_policy=policy,
+            defaults=defaults,
+            description=view.description,
         )
 
     def _make_inferences(
@@ -1864,6 +2249,11 @@ class FeatureStore:
                 self.registry.delete_entity(
                     entity.name, project=self.project, commit=False
                 )
+            # Refuse to delete a view that a *surviving* view still depends on.
+            # Views deleted in the same call may depend on each other.
+            self._guard_feature_view_deletions(
+                [*views_to_delete, *odfvs_to_delete, *sfvs_to_delete, *lvs_to_delete]
+            )
             for view in views_to_delete:
                 self.registry.delete_feature_view(
                     view.name, project=self.project, commit=False

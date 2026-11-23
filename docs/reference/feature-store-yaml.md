@@ -81,6 +81,20 @@ When `registry.mcp.enabled` is `true`, the REST registry server exposes registry
 metadata (entities, feature views, feature services) as MCP tool endpoints for
 LLM agents. Requires `feast[mcp]` to be installed.
 
+### derived_features
+
+Controls multi-layer derived feature chains (see the
+[derived feature chains guide](../how-to-guides/derived-feature-chains.md)).
+
+```yaml
+derived_features:
+  enabled: false
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | When `false`, an on-demand feature view may not declare another on-demand feature view as a source and chain registration is rejected. Single-layer on-demand feature views are unaffected. |
+
 ## Providers
 
 The `provider` field defines the environment in which Feast will execute data flows. As a result, it also determines the default values for other fields.

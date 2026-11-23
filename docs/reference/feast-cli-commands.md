@@ -253,6 +253,22 @@ v0       feature_view  2024-01-15 10:30:00  a1b2c3d4-...
 v1       feature_view  2024-01-16 14:22:00  e5f6g7h8-...
 ```
 
+## On demand feature views
+
+Print the derived feature dependency graph for review. Only view and feature
+names are printed, never feature values.
+
+```text
+feast on-demand-feature-views dependencies
+```
+
+```text
+derived feature dependencies:
+  1. ratio_view outputs=[ratio] inputs=[driver_stats:conv_rate, driver_stats:acc_rate]
+  2. rolling_view [on-demand source] outputs=[rolling] inputs=[ratio_view:ratio]
+  3. score_view [on-demand source] outputs=[score] inputs=[rolling_view:rolling]
+```
+
 ## Init
 
 Creates a new feature repository

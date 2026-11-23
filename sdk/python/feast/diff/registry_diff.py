@@ -312,6 +312,52 @@ def diff_between(
     return diff
 
 
+def _guard_deleted_view_references(
+    registry: BaseRegistry, registry_diff: RegistryDiff, project: str
+) -> None:
+    """Raise if a view deleted by this diff is still a source of a kept view."""
+    from feast.errors import FeatureViewInUseError
+
+    view_types = {
+        FeastObjectType.FEATURE_VIEW,
+        FeastObjectType.ON_DEMAND_FEATURE_VIEW,
+        FeastObjectType.STREAM_FEATURE_VIEW,
+        FeastObjectType.LABEL_VIEW,
+    }
+    deleting = {
+        diff.name
+        for diff in registry_diff.feast_object_diffs
+        if diff.transition_type == TransitionType.DELETE
+        and diff.feast_object_type in view_types
+    }
+    if not deleting:
+        return
+
+    updated_or_created = {
+        diff.name
+        for diff in registry_diff.feast_object_diffs
+        if diff.transition_type in (TransitionType.CREATE, TransitionType.UPDATE)
+        and diff.feast_object_type in view_types
+    }
+
+    try:
+        existing_views = registry.list_all_feature_views(project)
+    except Exception:
+        return
+
+    blocked: Dict[str, List[str]] = {}
+    for view in existing_views:
+        if view.name in deleting and view.name not in updated_or_created:
+            continue
+        projections = getattr(view, "source_feature_view_projections", None) or {}
+        for projection in projections.values():
+            if projection.name in deleting:
+                blocked.setdefault(projection.name, []).append(view.name)
+    if blocked:
+        first = sorted(blocked)[0]
+        raise FeatureViewInUseError(first, blocked[first])
+
+
 def apply_diff_to_registry(
     registry: BaseRegistry,
     registry_diff: RegistryDiff,
@@ -331,6 +377,10 @@ def apply_diff_to_registry(
             promoting them to the active definition. New versions are accessible
             only via explicit @v<N> reads.
     """
+    # Views removed in this diff may still be referenced by views that remain.
+    # Refuse the whole diff before mutating anything, naming the referrers.
+    _guard_deleted_view_references(registry, registry_diff, project)
+
     for feast_object_diff in registry_diff.feast_object_diffs:
         # There is no need to delete the object on an update, since applying the new object
         # will automatically delete the existing object.

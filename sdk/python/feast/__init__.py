@@ -21,6 +21,12 @@ from .batch_feature_view import BatchFeatureView
 from .chunker import BaseChunker, ChunkingConfig, TextChunker
 from .data_source import KafkaSource, KinesisSource, PushSource, RequestSource
 from .dataframe import DataFrameEngine, FeastDataFrame
+from .derived_feature import (
+    DerivationLayer,
+    DerivationResult,
+    DerivedFeatureChain,
+    MissingUpstreamPolicy,
+)
 from .doc_embedder import DocEmbedder, SchemaTransformFn
 from .embedder import (
     BaseEmbedder,
@@ -56,6 +62,10 @@ __all__ = [
     "BatchFeatureView",
     "copy_demo_notebooks",
     "DataFrameEngine",
+    "DerivationLayer",
+    "DerivationResult",
+    "DerivedFeatureChain",
+    "MissingUpstreamPolicy",
     "Entity",
     "KafkaSource",
     "KinesisSource",

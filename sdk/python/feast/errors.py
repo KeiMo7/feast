@@ -311,6 +311,42 @@ class SpecifiedFeaturesNotPresentError(FeastError):
         )
 
 
+class DerivedFeatureChainError(FeastError):
+    """Base error for invalid multi-layer derived feature definitions."""
+
+
+class MissingDerivationInputError(DerivedFeatureChainError):
+    """A derived feature declared an upstream that does not exist."""
+
+
+class DerivedFeatureCycleError(DerivedFeatureChainError):
+    """A derived feature chain declares a dependency cycle."""
+
+
+class IncompatibleDerivationTypeError(DerivedFeatureChainError):
+    """A derived feature feeds an upstream value into an incompatible input."""
+
+
+class DerivedFeatureTimeoutError(DerivedFeatureChainError):
+    """Raised when a caller requires completeness but evaluation timed out."""
+
+
+class DerivedFeatureEvaluationError(DerivedFeatureChainError):
+    """Raised when a layer failed and the caller required a complete result."""
+
+
+class FeatureViewInUseError(FeastError):
+    """A feature view cannot be deleted because other views still depend on it."""
+
+    def __init__(self, name: str, dependents: List[str]):
+        self.name = name
+        self.dependents = sorted(dependents)
+        super().__init__(
+            f"Cannot delete feature view '{name}' because it is still referenced by: "
+            f"{self.dependents}. Remove those references first."
+        )
+
+
 class SavedDatasetLocationAlreadyExists(FeastError):
     def __init__(self, location: str):
         super().__init__(f"Saved dataset location {location} already exists.")
